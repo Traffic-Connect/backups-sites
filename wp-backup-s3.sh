@@ -1,10 +1,5 @@
 #!/bin/bash
 # Бэкап WordPress-сайта (по домену) + загрузка в S3
-#
-# Установка AWS CLI на сервере: apt install awscli -y
-# wp-backup-s3.sh закинуть в директорию /usr/local/bin/wp-backup-s3.sh
-# Сделать исполняющим файл chmod +x /usr/local/bin/wp-backup-s3.sh
-# Запуск скрипта /usr/local/bin/wp-backup-s3.sh example.com
 
 # === ПРОВЕРКА АРГУМЕНТА ===
 if [ -z "$1" ]; then
@@ -37,7 +32,7 @@ WP_PATH="/home/$USER/web/$DOMAIN/public_html"
 BACKUP_DIR="/backup/$DOMAIN"
 
 # === S3 настройки для Backblaze B2 ===
-CREDS=$(curl -s https://0703564af843.ngrok-free.app/api/get-aws-creditnails)
+CREDS=$(curl -s https://manager.tcnct.com/api/get-aws-creditnails)
 
 AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r '.data.B2_KEY_ID')
 AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r '.data.B2_APPLICATION_KEY')
