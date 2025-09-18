@@ -1,0 +1,57 @@
+#!/bin/bash
+# info: run WordPress backup to S3
+# options: DOMAIN
+#
+# example: v-wp-backup-s3 example.com
+#
+# This function runs backup script for given domain.
+
+#----------------------------------------------------------#
+#                Variables & Functions                     #
+#----------------------------------------------------------#
+
+# Arguments
+domain=$1
+
+# Includes
+source /etc/hestiacp/hestia.conf
+source $HESTIA/func/main.sh
+source_conf "$HESTIA/conf/hestia.conf"
+
+#----------------------------------------------------------#
+#                    Verifications                         #
+#----------------------------------------------------------#
+
+check_args '1' "$#" 'DOMAIN'
+is_format_valid 'domain' "$domain"
+
+# Проверим что домен реально существует в системе Hestia
+get_user_by_domain "$domain"
+if [ -z "$user" ]; then
+    echo "1"
+    echo "Error: domain $domain not found"
+    exit 1
+fi
+
+#----------------------------------------------------------#
+#                       Action                             #
+#----------------------------------------------------------#
+
+/usr/local/bin/wp-backup-s3.sh "$domain"
+RESULT=$?
+
+#----------------------------------------------------------#
+#                       Hestia                             #
+#----------------------------------------------------------#
+
+if [ $RESULT -eq 0 ]; then
+    log_event "$OK" "$ARGUMENTS"
+    echo "0"
+    echo "Backup for $domain completed successfully"
+    exit 0
+else
+    log_event "$E_NOTEXIST" "$ARGUMENTS"
+    echo "1"
+    echo "Backup for $domain failed"
+    exit 1
+fi
