@@ -94,17 +94,43 @@ rm -f "$BACKUP_DIR/files.tar.gz" "$BACKUP_DIR/db.sql"
 # === ЗАГРУЗКА В S3 ===
 echo "☁️ Загружаем $ARCHIVE в S3..." | tee -a "$LOG_FILE"
 
-aws --endpoint-url "$AWS_ENDPOINT" s3 cp "$ARCHIVE" "s3://$AWS_BUCKET/backups/$DOMAIN/" >> "$LOG_FILE" 2>&1
+UPLOAD_OUTPUT=$(aws --endpoint-url "$AWS_ENDPOINT" s3 cp "$ARCHIVE" "s3://$AWS_BUCKET/backups/$DOMAIN/" 2>&1)
+UPLOAD_EXIT=$?
 
-if [ $? -eq 0 ]; then
-    echo "✅ Бэкап успешно загружен: s3://$AWS_BUCKET/backups/$DOMAIN/$(basename $ARCHIVE)" | tee -a "$LOG_FILE"
+if [ $UPLOAD_EXIT -eq 0 ]; then
+    FILE_URL="s3://$AWS_BUCKET/backups/$DOMAIN/$(basename $ARCHIVE)"
+    FILE_SIZE=$(stat -c%s "$ARCHIVE") # размер архива в байтах
+
+    echo "✅ Бэкап успешно загружен: $FILE_URL (size: $FILE_SIZE bytes)" | tee -a "$LOG_FILE"
 
     rm -f "$ARCHIVE"
-
     echo "done" > "$STATUS_FILE"
+
+    # Отправляем статус в API
+    curl -s -X POST "https://manager.tcnct.com/api/b2-webhooks/backup" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"domain\": \"$DOMAIN\",
+            \"status\": \"done\",
+            \"url\": \"$FILE_URL\",
+            \"size\": $FILE_SIZE,
+            \"service\": \"s3\"
+        }" >> "$LOG_FILE" 2>&1
 else
     echo "❌ Ошибка загрузки архива в S3" | tee -a "$LOG_FILE"
     echo "error" > "$STATUS_FILE"
+
+    # Отправляем ошибку в API
+    curl -s -X POST "https://manager.tcnct.com/api/b2-webhooks/backup" \
+        -H "Content-Type: application/json" \
+        -d "{
+            \"domain\": \"$DOMAIN\",
+            \"status\": \"error\",
+            \"code\": \"$UPLOAD_EXIT\",
+            \"message\": \"$(echo "$UPLOAD_OUTPUT" | sed 's/"/\\"/g')\",
+            \"service\": \"s3\"
+        }" >> "$LOG_FILE" 2>&1
+
     exit 1
 fi
 
