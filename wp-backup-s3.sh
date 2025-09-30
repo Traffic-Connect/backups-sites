@@ -64,20 +64,47 @@ if [ ! -f "$CONFIG" ]; then
 fi
 
 # === ЧТЕНИЕ ДАННЫХ ИЗ wp-config.php ===
-DB_NAME=$(grep DB_NAME "$CONFIG" | cut -d "'" -f4)
+DB_NAME=$(grep "define.*DB_NAME" "$CONFIG" | sed -E "s/.*['\"]DB_NAME['\"][[:space:]]*,[[:space:]]*['\"]([^'\"]+)['\"].*/\1/")
+
+if [ -z "$DB_NAME" ]; then
+    echo "Не удалось извлечь имя базы данных из $CONFIG" | tee -a "$LOG_FILE"
+    echo "error" > "$STATUS_FILE"
+    exit 1
+fi
+
+echo "Имя базы данных: $DB_NAME" | tee -a "$LOG_FILE"
 
 DATE=$(date +%F_%H-%M-%S)
 ARCHIVE="$BACKUP_DIR/wpbackup_${DOMAIN}_date_$DATE.tar.gz"
 
 # === БЭКАП БАЗЫ ===
 echo "Делаем дамп базы данных..." | tee -a "$LOG_FILE"
-mysqldump -uroot "$DB_NAME" > "$BACKUP_DIR/${DOMAIN}.sql" 2>>"$LOG_FILE"
+mysqldump -uroot "$DB_NAME" --skip-comments --compact > "$BACKUP_DIR/${DOMAIN}.sql" 2>>"$LOG_FILE"
 
-# === СОЗДАНИЕ АРХИВА (файлы WP + база в корне) ===
+if [ ! -s "$BACKUP_DIR/${DOMAIN}.sql" ]; then
+    echo "ОШИБКА: Дамп базы данных пустой" | tee -a "$LOG_FILE"
+    echo "error" > "$STATUS_FILE"
+    rm -f "$BACKUP_DIR/${DOMAIN}.sql"
+    exit 1
+fi
+
+# === СОЗДАНИЕ ВРЕМЕННОЙ ДИРЕКТОРИИ ===
+TMP_DIR="$BACKUP_DIR/tmp_backup"
+mkdir -p "$TMP_DIR"
+
+# Копируем файлы WordPress
+cp -r "$WP_PATH"/* "$TMP_DIR/" 2>>"$LOG_FILE"
+cp -r "$WP_PATH"/.* "$TMP_DIR/" 2>>"$LOG_FILE" || true
+
+# Копируем дамп базы
+cp "$BACKUP_DIR/${DOMAIN}.sql" "$TMP_DIR/"
+
+# === СОЗДАНИЕ АРХИВА ===
 echo "Создаём архив $ARCHIVE" | tee -a "$LOG_FILE"
-tar -czf "$ARCHIVE" -C "$WP_PATH" . -C "$BACKUP_DIR" "${DOMAIN}.sql" >> "$LOG_FILE" 2>&1
+tar -czf "$ARCHIVE" -C "$TMP_DIR" . >> "$LOG_FILE" 2>&1
 
-# Удаляем дамп базы
+# Удаляем временные файлы
+rm -rf "$TMP_DIR"
 rm -f "$BACKUP_DIR/${DOMAIN}.sql"
 
 # === ЗАГРУЗКА В S3 ===
