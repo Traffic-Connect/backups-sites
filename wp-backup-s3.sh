@@ -110,9 +110,6 @@ if [ $UPLOAD_EXIT -eq 0 ]; then
 
     echo "Бэкап успешно загружен: $FILE_URL (size: $FILE_SIZE bytes)" | tee -a "$LOG_FILE"
 
-    rm -f "$ARCHIVE"
-    echo "done" > "$STATUS_FILE"
-
     # Отправляем статус в API
     curl -s -X POST "https://manager.tcnct.com/api/b2-webhooks/backup" \
         -H "Content-Type: application/json" \
@@ -123,6 +120,12 @@ if [ $UPLOAD_EXIT -eq 0 ]; then
             \"size\": $FILE_SIZE,
             \"service\": \"s3\"
         }" >> "$LOG_FILE" 2>&1
+
+    # Удаляем архив и всю директорию бэкапа
+    rm -f "$ARCHIVE"
+    rm -rf "$BACKUP_DIR"
+
+    echo "Локальные файлы бэкапа удалены"
 else
     echo "Ошибка загрузки архива в S3" | tee -a "$LOG_FILE"
     echo "error" > "$STATUS_FILE"
@@ -134,11 +137,11 @@ else
             \"domain\": \"$DOMAIN\",
             \"status\": \"error\",
             \"code\": \"$UPLOAD_EXIT\",
-            \"message\": \"$(echo "$UPLOAD_OUTPUT" | sed 's/"/\\"/g')\",
+            \"message\": \"$(echo "$UPLOAD_OUTPUT\" | sed 's/"/\\"/g')\",
             \"service\": \"s3\"
         }" >> "$LOG_FILE" 2>&1
 
     exit 1
 fi
 
-echo "=== End backup $DOMAIN at $(date) ===" >> "$LOG_FILE"
+echo "=== End backup $DOMAIN at $(date) ==="
