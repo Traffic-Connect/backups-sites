@@ -14,12 +14,10 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Обновление списка пакетов
-echo "[1/5] Обновление списка пакетов..."
-apt update -qq
+
 
 # Установка jq
-echo "[2/5] Установка jq..."
+echo "[1/4] Установка jq..."
 if command -v jq &> /dev/null; then
     echo "  jq уже установлен (версия $(jq --version))"
 else
@@ -28,7 +26,7 @@ else
 fi
 
 # Установка AWS CLI
-echo "[3/5] Установка AWS CLI..."
+echo "[2/4] Установка AWS CLI..."
 if command -v aws &> /dev/null; then
     echo "  AWS CLI уже установлен (версия $(aws --version))"
 else
@@ -37,7 +35,7 @@ else
 fi
 
 # Установка curl (если не установлен)
-echo "[4/5] Проверка curl..."
+echo "[3/4] Проверка curl..."
 if command -v curl &> /dev/null; then
     echo "  curl уже установлен"
 else
@@ -46,7 +44,7 @@ else
 fi
 
 # Копирование скриптов
-echo "[5/5] Копирование скриптов..."
+echo "[4/4] Копирование скриптов..."
 
 # Проверка существования файлов
 if [ ! -f "v-wp-backup-s3" ]; then
