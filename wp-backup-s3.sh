@@ -88,23 +88,14 @@ if [ ! -s "$BACKUP_DIR/${DOMAIN}.sql" ]; then
     exit 1
 fi
 
-# === СОЗДАНИЕ ВРЕМЕННОЙ ДИРЕКТОРИИ ===
-TMP_DIR="$BACKUP_DIR/tmp_backup"
-mkdir -p "$TMP_DIR"
-
-# Копируем файлы WordPress
-cp -r "$WP_PATH"/* "$TMP_DIR/" 2>>"$LOG_FILE"
-cp -r "$WP_PATH"/.* "$TMP_DIR/" 2>>"$LOG_FILE" || true
-
-# Копируем дамп базы
-cp "$BACKUP_DIR/${DOMAIN}.sql" "$TMP_DIR/"
-
-# === СОЗДАНИЕ АРХИВА ===
+# === СОЗДАНИЕ АРХИВА НАПРЯМУЮ ===
 echo "Создаём архив $ARCHIVE" | tee -a "$LOG_FILE"
-tar -czf "$ARCHIVE" -C "$TMP_DIR" . >> "$LOG_FILE" 2>&1
 
-# Удаляем временные файлы
-rm -rf "$TMP_DIR"
+# Создаём архив: сначала файлы WordPress, потом добавляем дамп базы
+tar -czf "$ARCHIVE" -C "$WP_PATH" . --exclude='./.*' >> "$LOG_FILE" 2>&1
+tar -rzf "$ARCHIVE" -C "$BACKUP_DIR" "${DOMAIN}.sql" >> "$LOG_FILE" 2>&1
+
+# Удаляем дамп базы
 rm -f "$BACKUP_DIR/${DOMAIN}.sql"
 
 # === ЗАГРУЗКА В S3 ===
