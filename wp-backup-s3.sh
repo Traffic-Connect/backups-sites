@@ -79,12 +79,12 @@ ARCHIVE="$BACKUP_DIR/wpbackup_${DOMAIN}_date_$DATE.tar.gz"
 
 # === БЭКАП БАЗЫ ===
 echo "Делаем дамп базы данных..." | tee -a "$LOG_FILE"
-mysqldump -uroot "$DB_NAME" --skip-comments --compact > "$BACKUP_DIR/${DOMAIN}.sql" 2>>"$LOG_FILE"
+mysqldump -uroot "$DB_NAME" --skip-comments --compact > "$WP_PATH/${DOMAIN}.sql" 2>>"$LOG_FILE"
 
-if [ ! -s "$BACKUP_DIR/${DOMAIN}.sql" ]; then
+if [ ! -s "$WP_PATH/${DOMAIN}.sql" ]; then
     echo "ОШИБКА: Дамп базы данных пустой" | tee -a "$LOG_FILE"
     echo "error" > "$STATUS_FILE"
-    rm -f "$BACKUP_DIR/${DOMAIN}.sql"
+    rm -f "$WP_PATH/${DOMAIN}.sql"
     exit 1
 fi
 
@@ -93,10 +93,10 @@ echo "Создаём архив $ARCHIVE" | tee -a "$LOG_FILE"
 
 # Создаём архив напрямую с файлами в корне
 cd "$WP_PATH"
-tar -czf "$ARCHIVE" --exclude='./.??*' * "${BACKUP_DIR}/${DOMAIN}.sql" >> "$LOG_FILE" 2>&1
+tar -czf "$ARCHIVE" --exclude='./.??*' * >> "$LOG_FILE" 2>&1
 
 # Удаляем дамп базы
-rm -f "$BACKUP_DIR/${DOMAIN}.sql"
+rm -f "$WP_PATH/${DOMAIN}.sql"
 
 # === ЗАГРУЗКА В S3 ===
 echo "Загружаем $ARCHIVE в S3..." | tee -a "$LOG_FILE"
