@@ -14,8 +14,6 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-
-
 # Установка jq
 echo "[1/4] Установка jq..."
 if command -v jq &> /dev/null; then
@@ -58,14 +56,20 @@ if [ ! -f "wp-backup-s3.sh" ]; then
 fi
 
 # Копирование команды Hestia
+if [ -f "/usr/local/hestia/bin/v-wp-backup-s3" ]; then
+    echo "  v-wp-backup-s3 уже существует, перезаписываем..."
+fi
 cp v-wp-backup-s3 /usr/local/hestia/bin/
 chmod +x /usr/local/hestia/bin/v-wp-backup-s3
-echo "  v-wp-backup-s3 скопирован в /usr/local/hestia/bin/"
+echo "  v-wp-backup-s3 установлен в /usr/local/hestia/bin/"
 
 # Копирование основного скрипта
+if [ -f "/usr/local/bin/wp-backup-s3.sh" ]; then
+    echo "  wp-backup-s3.sh уже существует, перезаписываем..."
+fi
 cp wp-backup-s3.sh /usr/local/bin/
 chmod +x /usr/local/bin/wp-backup-s3.sh
-echo "  wp-backup-s3.sh скопирован в /usr/local/bin/"
+echo "  wp-backup-s3.sh установлен в /usr/local/bin/"
 
 # Создание директории для бэкапов
 mkdir -p /backup
