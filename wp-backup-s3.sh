@@ -88,14 +88,23 @@ if [ ! -s "$BACKUP_DIR/${DOMAIN}.sql" ]; then
     exit 1
 fi
 
-# === СОЗДАНИЕ АРХИВА НАПРЯМУЮ ===
+# === СОЗДАНИЕ ВРЕМЕННОЙ ДИРЕКТОРИИ ===
 echo "Создаём архив $ARCHIVE" | tee -a "$LOG_FILE"
+TMP_DIR="$BACKUP_DIR/tmp_backup"
+mkdir -p "$TMP_DIR"
 
-# Создаём архив: сначала файлы WordPress, потом добавляем дамп базы
-tar -czf "$ARCHIVE" -C "$WP_PATH" . --exclude='./.*' >> "$LOG_FILE" 2>&1
-tar -rzf "$ARCHIVE" -C "$BACKUP_DIR" "${DOMAIN}.sql" >> "$LOG_FILE" 2>&1
+# Копируем все файлы WordPress кроме скрытых . и ..
+cd "$WP_PATH"
+find . -mindepth 1 -maxdepth 1 ! -name '.' ! -name '..' -exec cp -r {} "$TMP_DIR/" \; 2>>"$LOG_FILE"
 
-# Удаляем дамп базы
+# Копируем дамп базы
+cp "$BACKUP_DIR/${DOMAIN}.sql" "$TMP_DIR/"
+
+# Создаём архив из временной директории
+tar -czf "$ARCHIVE" -C "$TMP_DIR" . >> "$LOG_FILE" 2>&1
+
+# Удаляем временные файлы
+rm -rf "$TMP_DIR"
 rm -f "$BACKUP_DIR/${DOMAIN}.sql"
 
 # === ЗАГРУЗКА В S3 ===
@@ -137,7 +146,7 @@ else
             \"domain\": \"$DOMAIN\",
             \"status\": \"error\",
             \"code\": \"$UPLOAD_EXIT\",
-            \"message\": \"$(echo "$UPLOAD_OUTPUT\" | sed 's/"/\\"/g')\",
+            \"message\": \"$(echo "$UPLOAD_OUTPUT" | sed 's/"/\\"/g')\",
             \"service\": \"s3\"
         }" >> "$LOG_FILE" 2>&1
 
