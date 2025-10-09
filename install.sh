@@ -50,8 +50,22 @@ if [ ! -f "v-wp-backup-s3" ]; then
     exit 1
 fi
 
+if [ ! -f "v-check-file-exists" ]; then
+    echo "ОШИБКА: Файл v-check-file-exists не найден в текущей директории"
+    exit 1
+fi
+
+if [ ! -f "v-wp-restore-s3" ]; then
+    echo "ОШИБКА: Файл v-wp-restore-s3 не найден в текущей директории"
+    exit 1
+fi
+
 if [ ! -f "wp-backup-s3.sh" ]; then
     echo "ОШИБКА: Файл wp-backup-s3.sh не найден в текущей директории"
+    exit 1
+fi
+if [ ! -f "wp-restore-s3.sh" ]; then
+    echo "ОШИБКА: Файл wp-restore-s3.sh не найден в текущей директории"
     exit 1
 fi
 
@@ -63,6 +77,22 @@ cp v-wp-backup-s3 /usr/local/hestia/bin/
 chmod +x /usr/local/hestia/bin/v-wp-backup-s3
 echo "  v-wp-backup-s3 установлен в /usr/local/hestia/bin/"
 
+# Копирование команды Hestia
+if [ -f "/usr/local/hestia/bin/v-check-file-exists" ]; then
+    echo "  v-check-file-exists уже существует, перезаписываем..."
+fi
+cp v-check-file-exists /usr/local/hestia/bin/
+chmod +x /usr/local/hestia/bin/v-check-file-exists
+echo "  v-check-file-exists установлен в /usr/local/hestia/bin/"
+
+# Копирование команды Hestia
+if [ -f "/usr/local/hestia/bin/v-wp-restore-s3" ]; then
+    echo "  v-wp-restore-s3 уже существует, перезаписываем..."
+fi
+cp v-wp-restore-s3 /usr/local/hestia/bin/
+chmod +x /usr/local/hestia/bin/v-wp-restore-s3
+echo "  v-wp-restore-s3 установлен в /usr/local/hestia/bin/"
+
 # Копирование основного скрипта
 if [ -f "/usr/local/bin/wp-backup-s3.sh" ]; then
     echo "  wp-backup-s3.sh уже существует, перезаписываем..."
@@ -70,6 +100,14 @@ fi
 cp wp-backup-s3.sh /usr/local/bin/
 chmod +x /usr/local/bin/wp-backup-s3.sh
 echo "  wp-backup-s3.sh установлен в /usr/local/bin/"
+
+# Копирование основного скрипта
+if [ -f "/usr/local/bin/wp-restore-s3.sh" ]; then
+    echo "  wp-restore-s3.sh уже существует, перезаписываем..."
+fi
+cp wp-restore-s3.sh /usr/local/bin/
+chmod +x /usr/local/bin/wp-restore-s3.sh
+echo "  wp-restore-s3.sh установлен в /usr/local/bin/"
 
 # Создание директории для бэкапов
 mkdir -p /backup
@@ -87,7 +125,10 @@ echo "  - curl: $(curl --version | head -n1)"
 echo ""
 echo "Установленные команды:"
 echo "  - /usr/local/hestia/bin/v-wp-backup-s3"
+echo "  - /usr/local/hestia/bin/v-wp-restore-s3"
+echo "  - /usr/local/hestia/bin/v-check-file-exists"
 echo "  - /usr/local/bin/wp-backup-s3.sh"
+echo "  - /usr/local/bin/wp-restore-s3.sh"
 echo ""
 echo "Тестирование:"
 echo "  /usr/local/bin/wp-backup-s3.sh example.com"
