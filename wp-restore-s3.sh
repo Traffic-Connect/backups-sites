@@ -47,7 +47,6 @@ if [ -z "$USER" ]; then
     else
         echo "Домен $DOMAIN успешно создан."
         PHP_VERSION=$(v-list-sys-php plain | head -n 1 | awk '{print $1}')
-        v-change-web-domain-tpl "$USER" "$DOMAIN" "php-fpm"
         v-add-letsencrypt-domain "$USER" "$DOMAIN" "www.$DOMAIN" >/dev/null 2>&1
     fi
 else
