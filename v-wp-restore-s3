@@ -1,0 +1,50 @@
+#!/bin/bash
+# info: run WordPress Restore Backup from S3
+# options: DOMAIN BACKUP_URL
+#
+# example: v-wp-restore-s3 example.com s3://bucket/path/to/backup.tar.gz
+#
+# This function runs restore script for given domain and backup URL.
+
+#----------------------------------------------------------#
+#                Variables & Functions                     #
+#----------------------------------------------------------#
+
+# Arguments
+domain=$1
+backup_url=$2
+
+# Includes
+source /etc/hestiacp/hestia.conf
+source $HESTIA/func/main.sh
+source_conf "$HESTIA/conf/hestia.conf"
+
+#----------------------------------------------------------#
+#                    Verifications                         #
+#----------------------------------------------------------#
+
+check_args '2' "$#" 'DOMAIN BACKUP_URL'
+is_format_valid 'domain' "$domain"
+
+#----------------------------------------------------------#
+#                       Action                             #
+#----------------------------------------------------------#
+
+/usr/local/bin/wp-restore-s3.sh "$domain" "$backup_url"
+RESULT=$?
+
+#----------------------------------------------------------#
+#                       Hestia                             #
+#----------------------------------------------------------#
+
+if [ $RESULT -eq 0 ]; then
+    log_event "$OK" "$ARGUMENTS"
+    echo "0"
+    echo "Backup for $domain from $backup_url restored successfully"
+    exit 0
+else
+    log_event "$E_NOTEXIST" "$ARGUMENTS"
+    echo "1"
+    echo "Backup for $domain from $backup_url failed"
+    exit 1
+fi
