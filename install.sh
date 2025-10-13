@@ -1,5 +1,6 @@
 #!/bin/bash
 # Скрипт установки зависимостей и команд для бэкапа WordPress
+# Версия: 1.0
 
 set -e
 
@@ -15,7 +16,7 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # Установка jq
-echo "[1/4] Установка jq..."
+echo "[1/5] Установка jq..."
 if command -v jq &> /dev/null; then
     echo "  jq уже установлен (версия $(jq --version))"
 else
@@ -23,17 +24,31 @@ else
     echo "  jq успешно установлен"
 fi
 
-# Установка AWS CLI
-echo "[2/4] Установка AWS CLI..."
+# Установка unzip (нужен для AWS CLI)
+echo "[2/5] Проверка unzip..."
+if command -v unzip &> /dev/null; then
+    echo "  unzip уже установлен"
+else
+    apt install -y unzip
+    echo "  unzip успешно установлен"
+fi
+
+# Установка AWS CLI v2
+echo "[3/5] Установка AWS CLI v2..."
 if command -v aws &> /dev/null; then
     echo "  AWS CLI уже установлен (версия $(aws --version))"
 else
-    apt install -y awscli
-    echo "  AWS CLI успешно установлен"
+    echo "  Скачивание AWS CLI v2..."
+    cd /tmp
+    curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+    unzip -q awscliv2.zip
+    sudo ./aws/install
+    rm -rf awscliv2.zip aws
+    echo "  AWS CLI v2 успешно установлен"
 fi
 
 # Установка curl (если не установлен)
-echo "[3/4] Проверка curl..."
+echo "[4/5] Проверка curl..."
 if command -v curl &> /dev/null; then
     echo "  curl уже установлен"
 else
@@ -42,7 +57,10 @@ else
 fi
 
 # Копирование скриптов
-echo "[4/4] Копирование скриптов..."
+echo "[5/5] Копирование скриптов..."
+
+# Возврат в исходную директорию
+cd - > /dev/null
 
 # Проверка существования файлов
 if [ ! -f "v-wp-backup-s3" ]; then
@@ -64,6 +82,7 @@ if [ ! -f "wp-backup-s3.sh" ]; then
     echo "ОШИБКА: Файл wp-backup-s3.sh не найден в текущей директории"
     exit 1
 fi
+
 if [ ! -f "wp-restore-s3.sh" ]; then
     echo "ОШИБКА: Файл wp-restore-s3.sh не найден в текущей директории"
     exit 1
@@ -120,7 +139,7 @@ echo "=========================================="
 echo ""
 echo "Установленные зависимости:"
 echo "  - jq: $(jq --version)"
-echo "  - AWS CLI: $(aws --version | cut -d' ' -f1)"
+echo "  - AWS CLI: $(aws --version)"
 echo "  - curl: $(curl --version | head -n1)"
 echo ""
 echo "Установленные команды:"
@@ -129,6 +148,9 @@ echo "  - /usr/local/hestia/bin/v-wp-restore-s3"
 echo "  - /usr/local/hestia/bin/v-check-file-exists"
 echo "  - /usr/local/bin/wp-backup-s3.sh"
 echo "  - /usr/local/bin/wp-restore-s3.sh"
+echo ""
+echo "Следующий шаг - настройка AWS CLI:"
+echo "  aws configure"
 echo ""
 echo "Тестирование:"
 echo "  /usr/local/bin/wp-backup-s3.sh example.com"
