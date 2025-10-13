@@ -41,7 +41,7 @@ if command -v aws &> /dev/null; then
 else
     echo "  Скачивание AWS CLI v2..."
     cd /tmp
-    curl -s "https://awscli.amazonaws.com/awscliv2.zip" -o "awscliv2.zip"
+    curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
     unzip -q awscliv2.zip
     sudo ./aws/install
     rm -rf awscliv2.zip aws
