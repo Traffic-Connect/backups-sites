@@ -1,6 +1,6 @@
 #!/bin/bash
 # Скрипт установки зависимостей и команд для бэкапа WordPress
-# VERSION: 1.1
+# VERSION: 1.2
 
 set -e
 
@@ -94,6 +94,10 @@ if [ ! -f "$CURRENT_DIR/wp-restore-s3.sh" ]; then
     echo "ОШИБКА: Файл wp-restore-s3.sh не найден в текущей директории"
     exit 1
 fi
+if [ ! -f "remove-domain.sh" ]; then
+    echo "ОШИБКА: Файл remove-domain.sh не найден в текущей директории"
+    exit 1
+fi
 
 # Копирование команды Hestia
 if [ -f "/usr/local/hestia/bin/v-wp-backup-s3" ]; then
@@ -134,6 +138,14 @@ fi
 cp "$CURRENT_DIR/wp-restore-s3.sh" /usr/local/bin/
 chmod +x /usr/local/bin/wp-restore-s3.sh
 echo "  wp-restore-s3.sh установлен в /usr/local/bin/"
+
+# Копирование основного скрипта
+if [ -f "/usr/local/bin/remove-domain.sh" ]; then
+    echo "  remove-domain.sh уже существует, перезаписываем..."
+fi
+cp remove-domain.sh /usr/local/bin/
+chmod +x /usr/local/bin/remove-domain.sh
+echo "  remove-domain.sh установлен в /usr/local/bin/"
 
 # Создание директории для бэкапов
 mkdir -p /backup
@@ -296,6 +308,7 @@ echo "  - /usr/local/hestia/bin/v-wp-restore-s3"
 echo "  - /usr/local/hestia/bin/v-check-file-exists"
 echo "  - /usr/local/bin/wp-backup-s3.sh"
 echo "  - /usr/local/bin/wp-restore-s3.sh"
+echo "  - /usr/local/bin/remove-domain.sh"
 echo "  - /usr/local/bin/wp-backup-auto-update.sh"
 echo ""
 echo "Автоматическое обновление:"
