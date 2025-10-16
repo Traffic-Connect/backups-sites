@@ -3,6 +3,8 @@
 # Скрипт для поиска и полного удаления домена из Hestia Control Panel у всех пользователей
 # Использование: ./remove-domain.sh domain.com
 
+VERSION="v1"
+
 set -e
 
 # Проверка аргументов

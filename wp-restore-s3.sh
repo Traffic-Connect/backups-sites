@@ -138,7 +138,7 @@ v-rebuild-web-domains "$USER" >/dev/null 2>&1
 v-update-user-stats "$USER" >/dev/null 2>&1
 
 # === Webhook ===
-WEBHOOK_URL="https://9d8f99d4eaf7.ngrok-free.app/api/b2-webhooks/restore"
+WEBHOOK_URL="https://manager.tcnct.com/api/b2-webhooks/restore"
 echo "Отправляю webhook со статусом '$RESTORE_STATUS'..." | tee -a "$LOG_FILE"
 
 WEBHOOK_RESPONSE=$(curl -s --max-time 10 -X POST "$WEBHOOK_URL" \
