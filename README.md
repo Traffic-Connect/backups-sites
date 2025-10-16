@@ -11,6 +11,7 @@
 | `v-wp-restore-s3` | Команда Hestia CP для запуска восстановления бэкапа   |
 | `wp-backup-s3.sh` | Основной скрипт создания бэкапа и загрузки в S3       |
 | `wp-restore-s3.sh` | Основной скрипт развертывания резервной копии с S3    |
+| `remove-domain.sh` | Поиск и удаление домена если он был на сервере        |
 | `install.sh` | Скрипт автоматической установки зависимостей          |
 
 ## Установка
@@ -72,6 +73,7 @@ backups-sites/
 ├── v-wp-restore-s3     # Команда Hestia CP
 ├── v-check-file-exists # Команда Hestia CP
 ├── wp-backup-s3.sh     # Основной скрипт бэкапа
+├── remove-domain.sh    # Скрипт поиска и удаления домена
 └── wp-restore-s3.sh    # Основной скрипт развертывания
 ```
 
@@ -101,7 +103,3 @@ v-wp-backup-s3 example.com
 ## Логи
 
 Логи сохраняются в `/backup/[domain]/backup.log`
-
-
-
-/usr/local/bin/wp-restore-s3.sh nightpanda.cyou s3://artem-test-bucket/backups/chickenroad-it.it/wpbackup_chickenroad-it.it_date_2025-10-08_12-54-22.tar.gz
