@@ -10,7 +10,6 @@
 #                Variables & Functions                     #
 #----------------------------------------------------------#
 
-# Arguments
 domain=$1
 backup_url=$2
 backup_id=$3
@@ -23,18 +22,31 @@ source $HESTIA/func/main.sh
 source_conf "$HESTIA/conf/hestia.conf"
 
 #----------------------------------------------------------#
-#                    Verifications                         #
+#                    Logging Setup                         #
 #----------------------------------------------------------#
 
-check_args '5' "$#" 'DOMAIN BACKUP_URL BACKUP_ID SITE_ID IS_DONOR'
-is_format_valid 'domain' "$domain"
+LOG_ROOT="/backup_restore"
+LOG_DIR="$LOG_ROOT/$domain"
+LOG_FILE="$LOG_DIR/v-wp-restore.log"
+
+mkdir -p "$LOG_DIR"
+
+echo "[$(date '+%F %T')] === Starting restore for $domain ===" >> "$LOG_FILE"
+echo "   BACKUP_URL: $backup_url" >> "$LOG_FILE"
+echo "   BACKUP_ID:  $backup_id" >> "$LOG_FILE"
+echo "   SITE_ID:    $site_id" >> "$LOG_FILE"
+echo "   IS_DONOR:   $is_donor" >> "$LOG_FILE"
+echo "--------------------------------------------------------" >> "$LOG_FILE"
 
 #----------------------------------------------------------#
 #                       Action                             #
 #----------------------------------------------------------#
 
-/usr/local/bin/wp-restore-s3.sh "$domain" "$backup_url" "$backup_id" "$site_id" "$is_donor"
+/usr/local/bin/wp-restore-s3.sh "$domain" "$backup_url" "$backup_id" "$site_id" "$is_donor" \
+    >>"$LOG_FILE" 2>&1
 RESULT=$?
+
+echo "[$(date '+%F %T')] Exit code: $RESULT" >> "$LOG_FILE"
 
 #----------------------------------------------------------#
 #                       Hestia                             #
@@ -42,12 +54,36 @@ RESULT=$?
 
 if [ $RESULT -eq 0 ]; then
     log_event "$OK" "$ARGUMENTS"
-    echo "0"
-    echo "Backup for $domain from $backup_url restored successfully"
-    exit 0
+    RESTORE_STATUS="done"
+    RESTORE_MESSAGE="Backup for $domain from $backup_url restored successfully"
+    echo "[$(date '+%F %T')] SUCCESS for $domain" >> "$LOG_FILE"
 else
     log_event "$E_NOTEXIST" "$ARGUMENTS"
-    echo "1"
-    echo "Backup for $domain from $backup_url failed"
-    exit 1
+    RESTORE_STATUS="error"
+    RESTORE_MESSAGE="Backup for $domain from $backup_url failed (exit code $RESULT)"
+    echo "[$(date '+%F %T')] ERROR for $domain (exit code $RESULT)" >> "$LOG_FILE"
+    echo "----- Last 20 log lines from restore -----" >> "$LOG_FILE"
+    tail -n 20 "$LOG_FILE" >> "$LOG_FILE"
 fi
+
+echo "--------------------------------------------------------" >> "$LOG_FILE"
+
+#----------------------------------------------------------#
+#                      JSON Response                       #
+#----------------------------------------------------------#
+
+JSON=$(cat <<EOF
+{
+  "domain": "$domain",
+  "backup_url": "$backup_url",
+  "backup_id": "$backup_id",
+  "site_id": "$site_id",
+  "is_donor": "$is_donor",
+  "restore_status": "$RESTORE_STATUS",
+  "restore_message": "$RESTORE_MESSAGE"
+}
+EOF
+)
+
+echo "$JSON"
+exit 0
