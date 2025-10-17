@@ -3,7 +3,7 @@
 # Восстановление сайта (WordPress или HTML) из S3 Backblaze B2 архива
 # ==============================================
 
-VERSION="v2"
+VERSION="v3"
 
 export PATH=$PATH:/usr/local/hestia/bin
 
@@ -81,20 +81,42 @@ cd "$RESTORE_DIR" || {
     RESTORE_MESSAGE="Ошибка: не удалось перейти в каталог $RESTORE_DIR"
 }
 
-aws --endpoint-url "$AWS_ENDPOINT" s3 cp "$FULL_S3_PATH" . 2>&1 | tee -a "$LOG_FILE"
+# === Определяем способ скачивания ===
+if [[ "$FULL_S3_PATH" == s3://* ]]; then
+    echo "Тип ссылки: S3 (через AWS CLI)" | tee -a "$LOG_FILE"
+    aws --endpoint-url "$AWS_ENDPOINT" s3 cp "$FULL_S3_PATH" . 2>&1 | tee -a "$LOG_FILE"
+else
+    echo "Тип ссылки: HTTPS (прямая загрузка)" | tee -a "$LOG_FILE"
+    BACKUP_FILE=$(basename "$FULL_S3_PATH")
+    curl -L -o "$BACKUP_FILE" "$FULL_S3_PATH" 2>&1 | tee -a "$LOG_FILE"
+fi
+
+# === Проверка результата скачивания ===
 if [ ! -f "$RESTORE_DIR/$BACKUP_FILE" ]; then
     RESTORE_STATUS="error"
     RESTORE_MESSAGE="Ошибка: архив не скачан"
+    echo "$RESTORE_MESSAGE" | tee -a "$LOG_FILE"
+    goto webhook
 fi
 
-# === Очистка и распаковка ===
+# === Очистка и подготовка каталога ===
 if [ -d "$WP_PATH" ]; then
     rm -rf "$WP_PATH"/*
 else
     mkdir -p "$WP_PATH"
 fi
 
-tar -xzf "$BACKUP_FILE" -C "$WP_PATH" --overwrite 2>&1 | tee -a "$LOG_FILE"
+# === Определяем тип архива и распаковываем ===
+echo "Распаковка архива: $BACKUP_FILE" | tee -a "$LOG_FILE"
+
+if [[ "$BACKUP_FILE" == *.tar.gz ]]; then
+    tar -xzf "$BACKUP_FILE" -C "$WP_PATH" --overwrite 2>&1 | tee -a "$LOG_FILE"
+elif [[ "$BACKUP_FILE" == *.zip ]]; then
+    unzip -o "$BACKUP_FILE" -d "$WP_PATH" 2>&1 | tee -a "$LOG_FILE"
+else
+    RESTORE_STATUS="error"
+    RESTORE_MESSAGE="Неизвестный формат архива: $BACKUP_FILE"
+fi
 
 # === Если это WordPress-сайт ===
 if [ "$IS_DONOR" == "true" ] || [ "$IS_DONOR" == "1" ]; then
@@ -137,7 +159,8 @@ fi
 v-rebuild-web-domains "$USER" >/dev/null 2>&1
 v-update-user-stats "$USER" >/dev/null 2>&1
 
-# === Webhook ===
+# === Отправка webhook ===
+webhook:
 WEBHOOK_URL="https://manager.tcnct.com/api/b2-webhooks/restore"
 echo "Отправляю webhook со статусом '$RESTORE_STATUS'..." | tee -a "$LOG_FILE"
 
@@ -155,5 +178,4 @@ WEBHOOK_RESPONSE=$(curl -s --max-time 10 -X POST "$WEBHOOK_URL" \
     }" 2>&1)
 
 echo "Webhook response: $WEBHOOK_RESPONSE" | tee -a "$LOG_FILE"
-echo "=== End restore $DOMAIN at $(date) ===" | tee -a "$LOG_FILE"
-exit 0
+echo "=== End restore $D
