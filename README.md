@@ -56,6 +56,12 @@ chmod +x install.sh
 /usr/local/bin/wp-backup-s3.sh example.com
 ```
 
+## Обновление
+
+```bash
+cd /root/backups && git checkout . && git pull origin main && bash install.sh
+```
+
 ## Требования
 
 - Hestia Control Panel
