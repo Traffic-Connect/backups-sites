@@ -1,20 +1,20 @@
 #!/bin/bash
 # Бэкап WordPress-сайта (по домену) + загрузка в S3
 
-VERSION="v1"
+VERSION="v2"
 
-# === ПРОВЕРКА АРГУМЕНТА ===
-if [ -z "$1" ]; then
-    echo "Использование: $0 domain.tld"
+# === ПРОВЕРКА АРГУМЕНТОВ ===
+if [ -z "$1" ] || [ -z "$2" ]; then
+    echo "Использование: $0 domain.tld environment"
+    echo "Пример: $0 example.com manager.tcnct.com"
     exit 1
 fi
 
 DOMAIN="$1"
+ENVIRONMENT="$2"
 
-# Сначала пытаемся через Hestia
+# === ПОЛЬЗОВАТЕЛЬ ===
 USER=$(v-search-domain-owner "$DOMAIN" plain 2>/dev/null | awk '{print $2}')
-
-# Если не нашли, пробуем по каталогам
 if [ -z "$USER" ]; then
     for user_dir in /home/*/; do
         if [ -d "${user_dir}web/${DOMAIN}/public_html" ]; then
@@ -32,9 +32,11 @@ fi
 # === НАСТРОЙКИ ===
 WP_PATH="/home/$USER/web/$DOMAIN/public_html"
 BACKUP_DIR="/backup/$DOMAIN"
+STATUS_FILE="$BACKUP_DIR/backup.status"
+LOG_FILE="$BACKUP_DIR/backup.log"
 
 # === S3 настройки для Backblaze B2 ===
-CREDS=$(curl -s https://manager.tcnct.com/api/get-aws-creditnails)
+CREDS=$(curl -s "https://${ENVIRONMENT}/api/get-aws-creditnails")
 
 AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r '.data.B2_KEY_ID')
 AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r '.data.B2_APPLICATION_KEY')
@@ -46,14 +48,7 @@ export AWS_ACCESS_KEY_ID
 export AWS_SECRET_ACCESS_KEY
 export AWS_DEFAULT_REGION="$AWS_REGION"
 
-# === ВСПОМОГАТЕЛЬНЫЕ ФАЙЛЫ ===
-STATUS_FILE="$BACKUP_DIR/backup.status"
-LOG_FILE="$BACKUP_DIR/backup.log"
-
-# Создаём папку
 mkdir -p "$BACKUP_DIR"
-
-# === УСТАНОВКА СТАТУСА "running" ===
 echo "running" > "$STATUS_FILE"
 echo "=== Start backup $DOMAIN (user $USER) at $(date) ===" > "$LOG_FILE"
 
@@ -65,44 +60,35 @@ if [ ! -f "$CONFIG" ]; then
     exit 1
 fi
 
-# === ЧТЕНИЕ ДАННЫХ ИЗ wp-config.php ===
+# === ИМЯ БАЗЫ ===
 DB_NAME=$(grep "define.*DB_NAME" "$CONFIG" | sed -E "s/.*['\"]DB_NAME['\"][[:space:]]*,[[:space:]]*['\"]([^'\"]+)['\"].*/\1/")
-
 if [ -z "$DB_NAME" ]; then
-    echo "Не удалось извлечь имя базы данных из $CONFIG" | tee -a "$LOG_FILE"
+    echo "Не удалось извлечь имя базы данных" | tee -a "$LOG_FILE"
     echo "error" > "$STATUS_FILE"
     exit 1
 fi
-
 echo "Имя базы данных: $DB_NAME" | tee -a "$LOG_FILE"
 
+# === СОЗДАНИЕ АРХИВА ===
 DATE=$(date +%F_%H-%M-%S)
 ARCHIVE="$BACKUP_DIR/wpbackup_${DOMAIN}_date_$DATE.tar.gz"
 
-# === БЭКАП БАЗЫ ===
-echo "Делаем дамп базы данных..." | tee -a "$LOG_FILE"
+echo "Создаём дамп базы..." | tee -a "$LOG_FILE"
 mysqldump -uroot "$DB_NAME" --skip-comments --compact > "$WP_PATH/${DOMAIN}.sql" 2>>"$LOG_FILE"
 
 if [ ! -s "$WP_PATH/${DOMAIN}.sql" ]; then
-    echo "ОШИБКА: Дамп базы данных пустой" | tee -a "$LOG_FILE"
+    echo "ОШИБКА: дамп пуст" | tee -a "$LOG_FILE"
     echo "error" > "$STATUS_FILE"
     rm -f "$WP_PATH/${DOMAIN}.sql"
     exit 1
 fi
 
-# === СОЗДАНИЕ АРХИВА ===
-echo "Создаём архив $ARCHIVE" | tee -a "$LOG_FILE"
-
-# Создаём архив напрямую с файлами в корне
 cd "$WP_PATH"
 tar -czf "$ARCHIVE" --exclude='./.??*' * >> "$LOG_FILE" 2>&1
-
-# Удаляем дамп базы
 rm -f "$WP_PATH/${DOMAIN}.sql"
 
 # === ЗАГРУЗКА В S3 ===
 echo "Загружаем $ARCHIVE в S3..." | tee -a "$LOG_FILE"
-
 UPLOAD_OUTPUT=$(aws --endpoint-url "$AWS_ENDPOINT" s3 cp "$ARCHIVE" "s3://$AWS_BUCKET/backups/$DOMAIN/" 2>&1)
 UPLOAD_EXIT=$?
 
@@ -110,10 +96,11 @@ if [ $UPLOAD_EXIT -eq 0 ]; then
     FILE_URL="s3://$AWS_BUCKET/backups/$DOMAIN/$(basename $ARCHIVE)"
     FILE_SIZE=$(stat -c%s "$ARCHIVE")
 
-    echo "Бэкап успешно загружен: $FILE_URL (size: $FILE_SIZE bytes)" | tee -a "$LOG_FILE"
+    echo "Бэкап успешно загружен: $FILE_URL ($FILE_SIZE bytes)" | tee -a "$LOG_FILE"
 
-    # Отправляем статус в API (с таймаутом и выводом результата)
-    WEBHOOK_RESPONSE=$(curl -s --max-time 10 -X POST "https://manager.tcnct.com/api/b2-webhooks/backup" \
+    WEBHOOK_URL="https://${ENVIRONMENT}/api/b2-webhooks/backup"
+
+    WEBHOOK_RESPONSE=$(curl -s --max-time 10 -X POST "$WEBHOOK_URL" \
         -H "Content-Type: application/json" \
         -d "{
             \"domain\": \"$DOMAIN\",
@@ -123,25 +110,16 @@ if [ $UPLOAD_EXIT -eq 0 ]; then
             \"service\": \"s3\"
         }" 2>&1)
 
-    WEBHOOK_EXIT=$?
+    echo "Webhook отправлен на $WEBHOOK_URL" | tee -a "$LOG_FILE"
+    echo "Ответ: $WEBHOOK_RESPONSE" | tee -a "$LOG_FILE"
 
-    echo "Webhook отправлен (exit code: $WEBHOOK_EXIT)" | tee -a "$LOG_FILE"
-    echo "Webhook response: $WEBHOOK_RESPONSE" | tee -a "$LOG_FILE"
-
-    # Удаляем архив
     rm -f "$ARCHIVE"
-
-    echo "Локальные файлы бэкапа удалены" | tee -a "$LOG_FILE"
-
-    # НЕ УДАЛЯЕМ BACKUP_DIR сразу, чтобы можно было проверить логи
-    # rm -rf "$BACKUP_DIR"  # ← Закомментировал это
-
 else
     echo "Ошибка загрузки архива в S3" | tee -a "$LOG_FILE"
     echo "error" > "$STATUS_FILE"
 
-    # Отправляем ошибку в API
-    WEBHOOK_RESPONSE=$(curl -s --max-time 10 -X POST "https://manager.tcnct.com/api/b2-webhooks/backup" \
+    WEBHOOK_URL="https://${ENVIRONMENT}/api/b2-webhooks/backup"
+    WEBHOOK_RESPONSE=$(curl -s --max-time 10 -X POST "$WEBHOOK_URL" \
         -H "Content-Type: application/json" \
         -d "{
             \"domain\": \"$DOMAIN\",
@@ -152,11 +130,9 @@ else
         }" 2>&1)
 
     echo "Webhook error response: $WEBHOOK_RESPONSE" | tee -a "$LOG_FILE"
-
     exit 1
 fi
 
 echo "=== End backup $DOMAIN at $(date) ===" | tee -a "$LOG_FILE"
 echo "Backup for $DOMAIN completed successfully"
-
 exit 0

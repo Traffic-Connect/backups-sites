@@ -6,7 +6,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="v4"
+VERSION="v5"
 
 export PATH=$PATH:/usr/local/hestia/bin
 
