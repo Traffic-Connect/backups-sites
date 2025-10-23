@@ -39,7 +39,7 @@ echo "→ IS_DONOR: $IS_DONOR"
 
 # === Функция отправки webhook ===
 send_webhook() {
-    local WEBHOOK_URL="https://manager.tcnct.com/api/b2-webhooks/restore"
+    local WEBHOOK_URL="https://49b9eacd3b7d.ngrok-free.app/api/b2-webhooks/restore"
     echo "Отправляю webhook со статусом '$RESTORE_STATUS'..." | tee -a "$LOG_FILE"
 
     curl -s --max-time 15 -X POST "$WEBHOOK_URL" \
