@@ -1,8 +1,8 @@
 #!/bin/bash
 # info: run WordPress backup to S3
-# options: DOMAIN ENVIRONMENT
+# options: DOMAIN ENVIRONMENT BACKUP_ID
 #
-# example: v-wp-backup-s3 example.com
+# example: v-wp-backup-s3 example.com manager.tcnct.com 1
 #
 # This function runs backup script for given domain.
 
@@ -13,6 +13,7 @@
 # Arguments
 domain=$1
 environment=$2
+backup_id=$3
 
 # Includes
 source /etc/hestiacp/hestia.conf
@@ -23,7 +24,7 @@ source_conf "$HESTIA/conf/hestia.conf"
 #                    Verifications                         #
 #----------------------------------------------------------#
 
-check_args '2' "$#" 'DOMAIN ENVIRONMENT'
+check_args '3' "$#" 'DOMAIN ENVIRONMENT BACKUP_ID'
 is_format_valid 'domain' "$domain"
 
 # Проверим что домен реально существует в системе Hestia
@@ -38,7 +39,7 @@ fi
 #                       Action                             #
 #----------------------------------------------------------#
 
-/usr/local/bin/wp-backup-s3.sh "$domain" "$environment"
+/usr/local/bin/wp-backup-s3.sh "$domain" "$environment" "$backup_id"
 RESULT=$?
 
 #----------------------------------------------------------#

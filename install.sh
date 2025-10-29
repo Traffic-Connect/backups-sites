@@ -1,6 +1,6 @@
 #!/bin/bash
 # Скрипт установки зависимостей и команд для бэкапа WordPress
-# VERSION: 1.2
+# VERSION: 1.3
 
 set -e
 
