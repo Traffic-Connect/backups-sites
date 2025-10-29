@@ -37,8 +37,7 @@ git clone https://github.com/Traffic-Connect/backups-sites.git .
 ### Шаг 4: Запустите установку
 
 ```bash
-chmod +x install.sh
-./install.sh
+chmod +x install.sh && ./install.sh
 ```
 
 Скрипт автоматически:
