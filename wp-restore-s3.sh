@@ -6,13 +6,13 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="v5"
+VERSION="v6"
 
 export PATH=$PATH:/usr/local/hestia/bin
 
 # === Проверка аргументов ===
-if [ $# -lt 5 ]; then
-    echo "Использование: $0 domain.tld s3://bucket/backups/domain/file.tar.gz backup_id site_id is_donor"
+if [ $# -lt 6 ]; then
+    echo "Использование: $0 domain.tld s3://bucket/backups/domain/file.tar.gz backup_id site_id is_donor environment"
     exit 1
 fi
 
@@ -21,6 +21,7 @@ FULL_S3_PATH="$2"
 BACKUP_ID="$3"
 SITE_ID="$4"
 IS_DONOR="$5" # true / false
+ENVIRONMENT="$6"
 BACKUP_FILE=$(basename "$FULL_S3_PATH")
 
 RESTORE_STATUS="done"
@@ -36,10 +37,11 @@ echo "→ DOMAIN: $DOMAIN"
 echo "→ BACKUP_ID: $BACKUP_ID"
 echo "→ SITE_ID: $SITE_ID"
 echo "→ IS_DONOR: $IS_DONOR"
+echo "→ ENVIRONMENT: $ENVIRONMENT"
 
 # === Функция отправки webhook ===
 send_webhook() {
-    local WEBHOOK_URL="https://manager.tcnct.com/api/b2-webhooks/restore"
+    local WEBHOOK_URL="https://${ENVIRONMENT}/api/b2-webhooks/restore"
     echo "Отправляю webhook со статусом '$RESTORE_STATUS'..." | tee -a "$LOG_FILE"
 
     curl -s --max-time 15 -X POST "$WEBHOOK_URL" \
@@ -83,7 +85,7 @@ if [ -z "$USER" ]; then
         fi
     else
         echo "Домен $DOMAIN успешно создан." | tee -a "$LOG_FILE"
-        PHP_VERSION=$(v-list-sys-php plain | head -n 1 | awk '{print $1}')
+        #PHP_VERSION=$(v-list-sys-php plain | head -n 1 | awk '{print $1}')
         v-add-letsencrypt-domain "$USER" "$DOMAIN" "www.$DOMAIN" >/dev/null 2>&1 || true
     fi
 else
@@ -93,7 +95,7 @@ fi
 WP_PATH="/home/$USER/web/$DOMAIN/public_html"
 
 # === Получаем креды к Backblaze B2 ===
-CREDS=$(curl -s https://manager.tcnct.com/api/get-aws-creditnails)
+CREDS=$(curl -s https://${ENVIRONMENT}/api/get-aws-creditnails)
 AWS_ACCESS_KEY_ID=$(echo "$CREDS" | jq -r '.data.B2_KEY_ID')
 AWS_SECRET_ACCESS_KEY=$(echo "$CREDS" | jq -r '.data.B2_APPLICATION_KEY')
 AWS_REGION=$(echo "$CREDS" | jq -r '.data.B2_REGION')
@@ -148,23 +150,41 @@ fi
 
 # === Определяем тип архива и распаковываем ===
 echo "Распаковка архива: $BACKUP_FILE" | tee -a "$LOG_FILE"
+EXTRACT_ERROR=0
+
 if [[ "$BACKUP_FILE" == *.tar.gz ]]; then
-    tar -xzf "$BACKUP_FILE" -C "$WP_PATH" --overwrite >> "$LOG_FILE" 2>&1 || {
+    if ! tar -xzf "$BACKUP_FILE" -C "$WP_PATH" --overwrite >> "$LOG_FILE" 2>&1; then
         RESTORE_STATUS="error"
         RESTORE_MESSAGE="Ошибка при распаковке архива (tar.gz)"
-        send_webhook
-        exit 1
-    }
+        echo "$RESTORE_MESSAGE" | tee -a "$LOG_FILE"
+        EXTRACT_ERROR=1
+    else
+        echo "Архив успешно распакован (tar.gz)" | tee -a "$LOG_FILE"
+    fi
 elif [[ "$BACKUP_FILE" == *.zip ]]; then
-    unzip -o "$BACKUP_FILE" -d "$WP_PATH" >> "$LOG_FILE" 2>&1 || {
+    if ! unzip -q -o "$BACKUP_FILE" -d "$WP_PATH" >> "$LOG_FILE" 2>&1; then
         RESTORE_STATUS="error"
         RESTORE_MESSAGE="Ошибка при распаковке архива (zip)"
-        send_webhook
-        exit 1
-    }
+        echo "$RESTORE_MESSAGE" | tee -a "$LOG_FILE"
+        echo "Подробности: $(tail -20 "$LOG_FILE")" | tee -a "$LOG_FILE"
+        EXTRACT_ERROR=1
+    else
+        echo "Архив успешно распакован (zip)" | tee -a "$LOG_FILE"
+    fi
 else
     RESTORE_STATUS="error"
     RESTORE_MESSAGE="Неизвестный формат архива: $BACKUP_FILE"
+    echo "$RESTORE_MESSAGE" | tee -a "$LOG_FILE"
+    EXTRACT_ERROR=1
+fi
+
+# === Если была ошибка при распаковке - выходим ===
+if [ $EXTRACT_ERROR -eq 1 ]; then
+    # Удаляем архив даже при ошибке распаковки
+    if [ -f "$RESTORE_DIR/$BACKUP_FILE" ]; then
+        rm -f "$RESTORE_DIR/$BACKUP_FILE"
+        echo "Архив удалён: $BACKUP_FILE" | tee -a "$LOG_FILE"
+    fi
     send_webhook
     exit 1
 fi
@@ -172,7 +192,32 @@ fi
 # === Если это WordPress-сайт ===
 if [[ "${IS_DONOR,,}" == "true" || "$IS_DONOR" == "1" ]]; then
     echo "Режим: WordPress (донор)" | tee -a "$LOG_FILE"
+
+    # === Автоматическое определение местоположения WordPress ===
     CONFIG="$WP_PATH/wp-config.php"
+
+    # Если wp-config.php не в корне, ищем его в подпапках
+    if [ ! -f "$CONFIG" ]; then
+        echo "wp-config.php не найден в корне, ищу в подпапках..." | tee -a "$LOG_FILE"
+
+        # Ищем первый найденный wp-config.php
+        FOUND_CONFIG=$(find "$WP_PATH" -maxdepth 2 -name "wp-config.php" -type f | head -n 1 || true)
+
+        if [ -f "$FOUND_CONFIG" ]; then
+            CONFIG="$FOUND_CONFIG"
+            # Определяем папку, где находится WordPress
+            WP_SUBDIR=$(dirname "$FOUND_CONFIG" | sed "s|$WP_PATH||" | sed 's|^/||')
+            if [ -n "$WP_SUBDIR" ]; then
+                echo "WordPress найден в подпапке: $WP_SUBDIR" | tee -a "$LOG_FILE"
+                WP_PATH="$WP_PATH/$WP_SUBDIR"
+            fi
+        else
+            RESTORE_STATUS="error"
+            RESTORE_MESSAGE="Ошибка: отсутствует wp-config.php в корне и подпапках"
+            send_webhook
+            exit 1
+        fi
+    fi
 
     if [ ! -f "$CONFIG" ]; then
         RESTORE_STATUS="error"
@@ -196,8 +241,17 @@ if [[ "${IS_DONOR,,}" == "true" || "$IS_DONOR" == "1" ]]; then
     mariadb -e "DROP DATABASE IF EXISTS \`$DB_NAME\`; CREATE DATABASE \`$DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" >/dev/null 2>&1
     mariadb -e "CREATE USER IF NOT EXISTS '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS'; GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'localhost'; FLUSH PRIVILEGES;" >/dev/null 2>&1
 
-    SQL_DUMP=$(find "$WP_PATH" -type f -name "*.sql" | head -n 1 || true)
-    if [ -f "$SQL_DUMP" ]; then
+    # SQL дамп всегда в корне архива, ищем его рекурсивно в RESTORE_DIR и WP_PATH
+    echo "Поиск SQL дампа..." | tee -a "$LOG_FILE"
+    SQL_DUMP=$(find "$RESTORE_DIR" -type f \( -name "*.sql" -o -name "*.sql.gz" \) 2>/dev/null | head -n 1 || true)
+
+    # Если не найден в RESTORE_DIR, ищем в WP_PATH (где распакован архив)
+    if [ -z "$SQL_DUMP" ] || [ ! -f "$SQL_DUMP" ]; then
+        SQL_DUMP=$(find "$WP_PATH" -type f \( -name "*.sql" -o -name "*.sql.gz" \) 2>/dev/null | head -n 1 || true)
+    fi
+
+    echo "Найден SQL дамп: $SQL_DUMP" | tee -a "$LOG_FILE"
+    if [ -n "$SQL_DUMP" ] && [ -f "$SQL_DUMP" ]; then
         if ! mariadb -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" < "$SQL_DUMP" >> "$LOG_FILE" 2>&1; then
             RESTORE_STATUS="error"
             RESTORE_MESSAGE="Ошибка при импорте SQL-дампа"
@@ -217,6 +271,12 @@ fi
 # === Пересборка Hestia и отправка webhook ===
 v-rebuild-web-domains "$USER" >/dev/null 2>&1 || true
 v-update-user-stats "$USER" >/dev/null 2>&1 || true
+
+# === Удаляем архив при успешном восстановлении ===
+if [ -f "$RESTORE_DIR/$BACKUP_FILE" ]; then
+    rm -f "$RESTORE_DIR/$BACKUP_FILE"
+    echo "Архив удалён: $BACKUP_FILE" | tee -a "$LOG_FILE"
+fi
 
 send_webhook
 echo "=== End restore $DOMAIN at $(date '+%F %T') ===" | tee -a "$LOG_FILE"
