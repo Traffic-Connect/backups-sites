@@ -1,18 +1,38 @@
 #!/bin/bash
 # Бэкап WordPress-сайта (по домену) + загрузка в S3
 
-VERSION="v3"
+VERSION="v4"
 
 # === ПРОВЕРКА АРГУМЕНТОВ ===
 if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ]; then
     echo "Использование: $0 domain.tld environment"
-    echo "Пример: $0 example.com manager.tcnct.com"
+    echo "Пример: $0 example.com manager.tcnct.com 1"
     exit 1
 fi
 
 DOMAIN="$1"
 ENVIRONMENT="$2"
 BACKUP_ID="$3"
+
+# === ПРОВЕРКА НАЛИЧИЯ ДОМЕНА ===
+# Ищем папку домена во всех пользовательских директориях
+DOMAIN_FOUND=0
+shopt -s nullglob  # Если нет совпадений, glob вернёт пустой список
+
+for user_dir in /home/*/web/$DOMAIN/public_html; do
+    if [ -d "$user_dir" ]; then
+        DOMAIN_FOUND=1
+        break
+    fi
+done
+
+shopt -u nullglob  # Отключаем nullglob
+
+if [ $DOMAIN_FOUND -eq 0 ]; then
+    echo "Ошибка: домен $DOMAIN не найден на сервере"
+    shopt -u nullglob
+    exit 1
+fi
 
 # === ПОЛЬЗОВАТЕЛЬ ===
 USER=$(v-search-domain-owner "$DOMAIN" plain 2>/dev/null | awk '{print $2}')
