@@ -6,13 +6,16 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="v6"
+VERSION="v7"
 
 export PATH=$PATH:/usr/local/hestia/bin
 
 # === Проверка аргументов ===
-if [ $# -lt 6 ]; then
-    echo "Использование: $0 domain.tld s3://bucket/backups/domain/file.tar.gz backup_id site_id is_donor environment"
+if [ $# -lt 7 ]; then
+    echo "Использование: $0 domain.tld s3://bucket/backups/domain/file.tar.gz backup_id site_id is_donor environment scheme_id"
+    #Example
+    #./usr/local/bin/wp-restore-s3.sh restore-test.com s3://artem-test-bucket/backups/midora.cyou/wpbackup_midora.cyou_date_2025-11-12_07-08-07.tar.gz 38 481 true manager-stg.tcnct.com 24
+    #./usr/local/bin/wp-restore-s3.sh movano.cyou s3://artem-test-bucket/schema-zips/24/d5869273-f110-4250-8780-41dd95484937-midora.cyou.zip 38 481 false manager-stg.tcnct.com 24
     exit 1
 fi
 
@@ -22,6 +25,7 @@ BACKUP_ID="$3"
 SITE_ID="$4"
 IS_DONOR="$5" # true / false
 ENVIRONMENT="$6"
+SCHEME_ID="$7"
 BACKUP_FILE=$(basename "$FULL_S3_PATH")
 
 RESTORE_STATUS="done"
@@ -38,6 +42,7 @@ echo "→ BACKUP_ID: $BACKUP_ID"
 echo "→ SITE_ID: $SITE_ID"
 echo "→ IS_DONOR: $IS_DONOR"
 echo "→ ENVIRONMENT: $ENVIRONMENT"
+echo "→ SCHEME_ID: $SCHEME_ID"
 
 # === Функция отправки webhook ===
 send_webhook() {
@@ -55,41 +60,124 @@ send_webhook() {
     "archive": "$FULL_S3_PATH",
     "site_id": "$SITE_ID",
     "is_donor": "$IS_DONOR",
+    "scheme_id": "$SCHEME_ID",
     "service": "s3"
 }
 JSON
 ) >> "$LOG_FILE" 2>&1 || true
 }
 
-# === Определяем пользователя ===
-USER=$(v-search-domain-owner "$DOMAIN" plain 2>/dev/null | awk '{print $2}') || true
+# === Определяем пользователя на основе scheme_id ===
+SCHEMA_USER="schema_${SCHEME_ID}"
 REMOVE_SCRIPT="/usr/local/bin/remove-domain.sh"
 
-if [ -z "$USER" ]; then
-    USER=$(v-list-users json | jq -r 'keys[0]')
-    echo "Домен $DOMAIN не найден. Создаю для пользователя $USER..." | tee -a "$LOG_FILE"
+# Проверяем существование пользователя schema_{scheme_id}
+if v-list-user "$SCHEMA_USER" >/dev/null 2>&1; then
+    echo "Пользователь $SCHEMA_USER уже существует" | tee -a "$LOG_FILE"
+    USER="$SCHEMA_USER"
+else
+    echo "Пользователь $SCHEMA_USER не найден. Создаю..." | tee -a "$LOG_FILE"
 
-    # --- Удаляем старый домен, если остался ---
+    # Генерируем случайный пароль для нового пользователя
+    USER_PASSWORD=$(openssl rand -base64 16)
+    USER_EMAIL="schema_${SCHEME_ID}@tcnct.com"
+
+    # Создаём пользователя
+    echo "Выполняю: v-add-user $SCHEMA_USER ******** $USER_EMAIL" | tee -a "$LOG_FILE"
+    USER_CREATE_OUTPUT=$(v-add-user "$SCHEMA_USER" "$USER_PASSWORD" "$USER_EMAIL" 2>&1) || USER_CREATE_FAILED=$?
+
+    if [ "${USER_CREATE_FAILED:-0}" -ne 0 ]; then
+        echo "v-add-user вернул код ошибки: $USER_CREATE_FAILED" | tee -a "$LOG_FILE"
+        echo "Вывод команды: $USER_CREATE_OUTPUT" | tee -a "$LOG_FILE"
+        RESTORE_STATUS="error"
+        RESTORE_MESSAGE="Ошибка: не удалось создать пользователя $SCHEMA_USER. Детали: $USER_CREATE_OUTPUT"
+        send_webhook
+        exit 1
+    else
+        echo "Пользователь $SCHEMA_USER успешно создан" | tee -a "$LOG_FILE"
+        USER="$SCHEMA_USER"
+    fi
+fi
+
+# Проверяем, существует ли домен у этого пользователя
+EXISTING_OWNER=$(v-search-domain-owner "$DOMAIN" plain 2>/dev/null | awk '{print $2}') || true
+
+if [ -n "$EXISTING_OWNER" ]; then
+    if [ "$EXISTING_OWNER" != "$USER" ]; then
+        echo "Домен $DOMAIN найден у другого пользователя ($EXISTING_OWNER). Удаляю..." | tee -a "$LOG_FILE"
+    else
+        echo "Домен $DOMAIN уже существует у пользователя $USER. Пересоздаю..." | tee -a "$LOG_FILE"
+    fi
+
+    # --- Удаляем старый домен ---
     if [ -f "$REMOVE_SCRIPT" ]; then
-        echo "Проверка и удаление старого домена (если есть)..." | tee -a "$LOG_FILE"
         bash "$REMOVE_SCRIPT" "$DOMAIN" >> "$LOG_FILE" 2>&1 || true
     fi
 
-    # --- Создаём домен ---
-    if ! v-add-domain "$USER" "$DOMAIN" >/dev/null 2>&1; then
-        if [ ! -f "/usr/local/hestia/data/users/$USER/domains/$DOMAIN.conf" ]; then
-            RESTORE_STATUS="error"
-            RESTORE_MESSAGE="Ошибка: не удалось создать домен $DOMAIN"
-            send_webhook
-            exit 1
+    # Пробуем удалить через v-delete-domain у найденного владельца
+    v-delete-domain "$EXISTING_OWNER" "$DOMAIN" >> "$LOG_FILE" 2>&1 || true
+else
+    echo "Домен $DOMAIN не найден через v-search-domain-owner. Проверяю наличие домена в системе..." | tee -a "$LOG_FILE"
+
+    # Ищем домен у всех пользователей
+    ALL_USERS=$(v-list-users plain | awk '{print $1}')
+    for CHECK_USER in $ALL_USERS; do
+        if v-list-web-domain "$CHECK_USER" "$DOMAIN" >/dev/null 2>&1; then
+            echo "Найден домен $DOMAIN у пользователя $CHECK_USER. Удаляю..." | tee -a "$LOG_FILE"
+            v-delete-domain "$CHECK_USER" "$DOMAIN" >> "$LOG_FILE" 2>&1 || true
+            break
         fi
-    else
-        echo "Домен $DOMAIN успешно создан." | tee -a "$LOG_FILE"
-        #PHP_VERSION=$(v-list-sys-php plain | head -n 1 | awk '{print $1}')
-        v-add-letsencrypt-domain "$USER" "$DOMAIN" "www.$DOMAIN" >/dev/null 2>&1 || true
+    done
+
+    echo "Создаю домен для пользователя $USER..." | tee -a "$LOG_FILE"
+fi
+
+# --- Проверяем и удаляем папку домена, если она существует ---
+DOMAIN_WEB_PATH="/home/$USER/web/$DOMAIN"
+if [ -d "$DOMAIN_WEB_PATH" ]; then
+    echo "Найдена существующая папка домена: $DOMAIN_WEB_PATH - удаляю..." | tee -a "$LOG_FILE"
+    rm -rf "$DOMAIN_WEB_PATH" >> "$LOG_FILE" 2>&1 || true
+fi
+
+# --- Проверяем и удаляем DNS-зону, если она существует ---
+if v-list-dns-domain "$USER" "$DOMAIN" >/dev/null 2>&1; then
+    echo "Найдена существующая DNS-зона для домена: $DOMAIN - удаляю..." | tee -a "$LOG_FILE"
+    v-delete-dns-domain "$USER" "$DOMAIN" >> "$LOG_FILE" 2>&1 || true
+fi
+
+# --- Проверяем и удаляем остатки конфигурации домена в HestiaCP ---
+HESTIA_DOMAIN_CONF="/usr/local/hestia/data/users/$USER/web/$DOMAIN.conf"
+if [ -f "$HESTIA_DOMAIN_CONF" ]; then
+    echo "Найден конфигурационный файл домена в HestiaCP: $HESTIA_DOMAIN_CONF - удаляю..." | tee -a "$LOG_FILE"
+    rm -f "$HESTIA_DOMAIN_CONF" >> "$LOG_FILE" 2>&1 || true
+    rm -f "/usr/local/hestia/data/users/$USER/web/$DOMAIN."* >> "$LOG_FILE" 2>&1 || true
+fi
+
+# --- Создаём домен (только WEB, без DNS и MAIL) ---
+echo "Попытка создать домен $DOMAIN для пользователя $USER..." | tee -a "$LOG_FILE"
+DOMAIN_CREATE_OUTPUT=$(v-add-web-domain "$USER" "$DOMAIN" 2>&1) || DOMAIN_CREATE_FAILED=$?
+
+if [ "${DOMAIN_CREATE_FAILED:-0}" -ne 0 ]; then
+    echo "v-add-domain вернул код ошибки: $DOMAIN_CREATE_FAILED" | tee -a "$LOG_FILE"
+    echo "Вывод команды: $DOMAIN_CREATE_OUTPUT" | tee -a "$LOG_FILE"
+
+    if [ ! -f "/usr/local/hestia/data/users/$USER/domains/$DOMAIN.conf" ]; then
+        RESTORE_STATUS="error"
+        RESTORE_MESSAGE="Ошибка: не удалось создать домен $DOMAIN. Детали: $DOMAIN_CREATE_OUTPUT"
+        send_webhook
+        exit 1
     fi
 else
-    echo "Домен $DOMAIN найден, пользователь: $USER" | tee -a "$LOG_FILE"
+    echo "Домен $DOMAIN успешно создан." | tee -a "$LOG_FILE"
+
+    # Меняем шаблон прокси на tc-nginx-only
+    echo "Изменяю прокси шаблон на tc-nginx-only..." | tee -a "$LOG_FILE"
+    v-change-web-domain-proxy-tpl "$USER" "$DOMAIN" "tc-nginx-only" >> "$LOG_FILE" 2>&1 || {
+        echo "Предупреждение: не удалось изменить прокси шаблон" | tee -a "$LOG_FILE"
+    }
+
+    # Добавляем SSL сертификат Let's Encrypt
+    v-add-letsencrypt-domain "$USER" "$DOMAIN" "www.$DOMAIN" >/dev/null 2>&1 || true
 fi
 
 WP_PATH="/home/$USER/web/$DOMAIN/public_html"
@@ -189,6 +277,26 @@ if [ $EXTRACT_ERROR -eq 1 ]; then
     exit 1
 fi
 
+# === Устанавливаем правильного владельца файлов ===
+echo "Устанавливаю владельца файлов для текущего домена: $USER:$USER..." | tee -a "$LOG_FILE"
+chown -R "$USER":"$USER" "$WP_PATH" >> "$LOG_FILE" 2>&1 || {
+    echo "Предупреждение: не удалось установить владельца файлов" | tee -a "$LOG_FILE"
+}
+
+# === Исправляем права для всех остальных доменов этого пользователя ===
+echo "Проверяю и исправляю права для всех доменов пользователя $USER..." | tee -a "$LOG_FILE"
+USER_WEB_PATH="/home/$USER/web"
+if [ -d "$USER_WEB_PATH" ]; then
+    for DOMAIN_DIR in "$USER_WEB_PATH"/*/ ; do
+        if [ -d "$DOMAIN_DIR" ]; then
+            DOMAIN_NAME=$(basename "$DOMAIN_DIR")
+            echo "  - Исправляю права для домена: $DOMAIN_NAME" | tee -a "$LOG_FILE"
+            chown -R "$USER":"$USER" "$DOMAIN_DIR" >> "$LOG_FILE" 2>&1 || true
+        fi
+    done
+    echo "Права для всех доменов пользователя $USER исправлены" | tee -a "$LOG_FILE"
+fi
+
 # === Если это WordPress-сайт ===
 if [[ "${IS_DONOR,,}" == "true" || "$IS_DONOR" == "1" ]]; then
     echo "Режим: WordPress (донор)" | tee -a "$LOG_FILE"
@@ -210,6 +318,22 @@ if [[ "${IS_DONOR,,}" == "true" || "$IS_DONOR" == "1" ]]; then
             if [ -n "$WP_SUBDIR" ]; then
                 echo "WordPress найден в подпапке: $WP_SUBDIR" | tee -a "$LOG_FILE"
                 WP_PATH="$WP_PATH/$WP_SUBDIR"
+
+                # Меняем document root для веб-сервера
+                # Формат: v-change-web-domain-docroot USER DOMAIN TARGET_DOMAIN [DIRECTORY]
+                echo "Изменяю document root на подпапку: $WP_SUBDIR" | tee -a "$LOG_FILE"
+                echo "Выполняю: v-change-web-domain-docroot $USER $DOMAIN $DOMAIN $WP_SUBDIR" | tee -a "$LOG_FILE"
+
+                DOCROOT_OUTPUT=$(v-change-web-domain-docroot "$USER" "$DOMAIN" "$DOMAIN" "$WP_SUBDIR" 2>&1) || DOCROOT_FAILED=$?
+
+                if [ "${DOCROOT_FAILED:-0}" -ne 0 ]; then
+                    echo "v-change-web-domain-docroot вернул код ошибки: $DOCROOT_FAILED" | tee -a "$LOG_FILE"
+                    echo "Вывод команды: $DOCROOT_OUTPUT" | tee -a "$LOG_FILE"
+                    echo "Предупреждение: не удалось изменить document root" | tee -a "$LOG_FILE"
+                else
+                    echo "Document root успешно изменен на подпапку: $WP_SUBDIR" | tee -a "$LOG_FILE"
+                    echo "Вывод команды: $DOCROOT_OUTPUT" | tee -a "$LOG_FILE"
+                fi
             fi
         else
             RESTORE_STATUS="error"
@@ -248,6 +372,13 @@ if [[ "${IS_DONOR,,}" == "true" || "$IS_DONOR" == "1" ]]; then
     # Если не найден в RESTORE_DIR, ищем в WP_PATH (где распакован архив)
     if [ -z "$SQL_DUMP" ] || [ ! -f "$SQL_DUMP" ]; then
         SQL_DUMP=$(find "$WP_PATH" -type f \( -name "*.sql" -o -name "*.sql.gz" \) 2>/dev/null | head -n 1 || true)
+    fi
+
+    # Если WordPress в подпапке, SQL дамп может быть в родительской папке (в корне архива)
+    if [ -z "$SQL_DUMP" ] || [ ! -f "$SQL_DUMP" ]; then
+        PARENT_PATH=$(dirname "$WP_PATH")
+        SQL_DUMP=$(find "$PARENT_PATH" -maxdepth 1 -type f \( -name "*.sql" -o -name "*.sql.gz" \) 2>/dev/null | head -n 1 || true)
+        echo "Поиск SQL дампа в родительской папке: $PARENT_PATH" | tee -a "$LOG_FILE"
     fi
 
     echo "Найден SQL дамп: $SQL_DUMP" | tee -a "$LOG_FILE"
