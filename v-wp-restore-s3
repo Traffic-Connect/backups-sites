@@ -1,8 +1,8 @@
 #!/bin/bash
 # info: run WordPress Restore Backup from S3
-# options: DOMAIN BACKUP_URL BACKUP_ID SITE_ID IS_DONOR ENVIRONMENT
+# options: DOMAIN BACKUP_URL BACKUP_ID SITE_ID IS_DONOR ENVIRONMENT SCHEMA_ID
 #
-# example: v-wp-restore-s3 example.com s3://bucket/path/to/backup.tar.gz 42 17 true
+# example: v-wp-restore-s3 example.com s3://bucket/path/to/backup.tar.gz 42 17 true 100
 #
 # This function runs restore script for given domain and backup URL.
 
@@ -16,6 +16,8 @@ backup_id=$3
 site_id=$4
 is_donor=$5
 environment=$6
+schema_id=$7
+
 # Includes
 source /etc/hestiacp/hestia.conf
 source $HESTIA/func/main.sh
@@ -37,13 +39,14 @@ echo "   BACKUP_ID:  $backup_id" >> "$LOG_FILE"
 echo "   SITE_ID:    $site_id" >> "$LOG_FILE"
 echo "   IS_DONOR:   $is_donor" >> "$LOG_FILE"
 echo "   ENVIRONMENT:   $environment" >> "$LOG_FILE"
+echo "   SCHEMA ID:   $schema_id" >> "$LOG_FILE"
 echo "--------------------------------------------------------" >> "$LOG_FILE"
 
 #----------------------------------------------------------#
 #                       Action                             #
 #----------------------------------------------------------#
 
-/usr/local/bin/wp-restore-s3.sh "$domain" "$backup_url" "$backup_id" "$site_id" "$is_donor" "$environment" \
+/usr/local/bin/wp-restore-s3.sh "$domain" "$backup_url" "$backup_id" "$site_id" "$is_donor" "$environment" "$schema_id" \
     >>"$LOG_FILE" 2>&1
 RESULT=$?
 
@@ -79,6 +82,7 @@ JSON=$(cat <<EOF
   "backup_url": "$backup_url",
   "backup_id": "$backup_id",
   "site_id": "$site_id",
+  "schema_id": "$schema_id",
   "is_donor": "$is_donor",
   "restore_status": "$RESTORE_STATUS",
   "restore_message": "$RESTORE_MESSAGE"
