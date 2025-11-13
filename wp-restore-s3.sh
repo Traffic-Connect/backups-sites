@@ -6,7 +6,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="v7"
+VERSION="v8"
 
 export PATH=$PATH:/usr/local/hestia/bin
 
@@ -350,11 +350,11 @@ if [[ "${IS_DONOR,,}" == "true" || "$IS_DONOR" == "1" ]]; then
         exit 1
     fi
 
-    DB_NAME=$(grep -E "DB_NAME" "$CONFIG" | sed -E "s/.*['\"]DB_NAME['\"].*['\"]([^'\"]+)['\"].*/\1/")
-    DB_USER=$(grep -E "DB_USER" "$CONFIG" | sed -E "s/.*['\"]DB_USER['\"].*['\"]([^'\"]+)['\"].*/\1/")
-    DB_PASS=$(grep -E "DB_PASSWORD" "$CONFIG" | sed -E "s/.*['\"]DB_PASSWORD['\"].*['\"]([^'\"]+)['\"].*/\1/")
+    OLD_DB_NAME=$(grep -E "DB_NAME" "$CONFIG" | sed -E "s/.*['\"]DB_NAME['\"].*['\"]([^'\"]+)['\"].*/\1/")
+    OLD_DB_USER=$(grep -E "DB_USER" "$CONFIG" | sed -E "s/.*['\"]DB_USER['\"].*['\"]([^'\"]+)['\"].*/\1/")
+    OLD_DB_PASS=$(grep -E "DB_PASSWORD" "$CONFIG" | sed -E "s/.*['\"]DB_PASSWORD['\"].*['\"]([^'\"]+)['\"].*/\1/")
 
-    if [ -z "$DB_NAME" ] || [ -z "$DB_USER" ]; then
+    if [ -z "$OLD_DB_NAME" ] || [ -z "$OLD_DB_USER" ]; then
         RESTORE_STATUS="error"
         RESTORE_MESSAGE="Ошибка: не удалось прочитать настройки БД"
         send_webhook
@@ -362,8 +362,70 @@ if [[ "${IS_DONOR,,}" == "true" || "$IS_DONOR" == "1" ]]; then
     fi
 
     echo "Импорт базы данных..." | tee -a "$LOG_FILE"
-    mariadb -e "DROP DATABASE IF EXISTS \`$DB_NAME\`; CREATE DATABASE \`$DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" >/dev/null 2>&1
-    mariadb -e "CREATE USER IF NOT EXISTS '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS'; GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'localhost'; FLUSH PRIVILEGES;" >/dev/null 2>&1
+    echo "Старое имя БД из wp-config.php: $OLD_DB_NAME" | tee -a "$LOG_FILE"
+    echo "Старый пользователь БД из wp-config.php: $OLD_DB_USER" | tee -a "$LOG_FILE"
+
+    # Генерируем уникальное короткое имя БД (v-add-database добавит префикс USER_ автоматически)
+    # Используем домен без точек + timestamp для уникальности
+    CLEAN_DOMAIN=$(echo "$DOMAIN" | tr '.' '_' | tr '-' '_')
+    TIMESTAMP=$(date +%s | tail -c 5)  # Последние 4 цифры timestamp
+    SHORT_DB_NAME=$(echo "$CLEAN_DOMAIN" | cut -c1-12)_${TIMESTAMP}
+
+    echo "Короткое имя БД (без префикса): $SHORT_DB_NAME" | tee -a "$LOG_FILE"
+
+    # Генерируем короткое имя пользователя БД на основе домена + timestamp
+    # HestiaCP добавит префикс USER_, поэтому используем короткое имя
+    SHORT_DB_USER=$(echo "$CLEAN_DOMAIN" | cut -c1-8)_u${TIMESTAMP}
+
+    # MySQL имеет лимит 32 символа для username
+    # Формат будет: schema_24_<SHORT_DB_USER> (примерно 10+1+8+2+4 = 25 символов)
+    echo "Короткое имя пользователя БД (без префикса): $SHORT_DB_USER" | tee -a "$LOG_FILE"
+
+    # Генерируем новый пароль для БД
+    NEW_DB_PASS=$(openssl rand -base64 16)
+
+    echo "Новый пользователь БД: $SHORT_DB_USER" | tee -a "$LOG_FILE"
+
+    # Создаём базу данных через HestiaCP (используем короткое имя, HestiaCP добавит префикс)
+    # Уникальное имя гарантирует отсутствие конфликтов
+    echo "Создаю базу данных $SHORT_DB_NAME через v-add-database..." | tee -a "$LOG_FILE"
+    DB_CREATE_OUTPUT=$(v-add-database "$USER" "$SHORT_DB_NAME" "$SHORT_DB_USER" "$NEW_DB_PASS" "mysql" "localhost" "utf8mb4" 2>&1) || DB_CREATE_FAILED=$?
+
+    if [ "${DB_CREATE_FAILED:-0}" -ne 0 ]; then
+        echo "v-add-database вернул код ошибки: $DB_CREATE_FAILED" | tee -a "$LOG_FILE"
+        echo "Вывод команды: $DB_CREATE_OUTPUT" | tee -a "$LOG_FILE"
+        RESTORE_STATUS="error"
+        RESTORE_MESSAGE="Ошибка: не удалось создать базу данных $SHORT_DB_NAME. Детали: $DB_CREATE_OUTPUT"
+        send_webhook
+        exit 1
+    else
+        echo "База данных $SHORT_DB_NAME успешно создана" | tee -a "$LOG_FILE"
+    fi
+
+    # HestiaCP добавляет префикс USER_ к имени БД и пользователя, формируем полные имена
+    FULL_DB_NAME="${USER}_${SHORT_DB_NAME}"
+    FULL_DB_USER="${USER}_${SHORT_DB_USER}"
+    echo "Полное имя БД с префиксом: $FULL_DB_NAME" | tee -a "$LOG_FILE"
+    echo "Полное имя пользователя БД с префиксом: $FULL_DB_USER" | tee -a "$LOG_FILE"
+
+    # Обновляем wp-config.php с новыми кредами БД
+    echo "Обновляю wp-config.php с новыми кредами БД..." | tee -a "$LOG_FILE"
+
+    # Обновляем DB_NAME (используем | как разделитель вместо /)
+    sed -i "s|define([[:space:]]*['\"]DB_NAME['\"][[:space:]]*,[[:space:]]*['\"][^'\"]*['\"][[:space:]]*);|define('DB_NAME', '$FULL_DB_NAME');|" "$CONFIG"
+
+    # Обновляем DB_USER
+    sed -i "s|define([[:space:]]*['\"]DB_USER['\"][[:space:]]*,[[:space:]]*['\"][^'\"]*['\"][[:space:]]*);|define('DB_USER', '$FULL_DB_USER');|" "$CONFIG"
+
+    # Обновляем DB_PASSWORD
+    sed -i "s|define([[:space:]]*['\"]DB_PASSWORD['\"][[:space:]]*,[[:space:]]*['\"][^'\"]*['\"][[:space:]]*);|define('DB_PASSWORD', '$NEW_DB_PASS');|" "$CONFIG"
+
+    echo "wp-config.php обновлён с новыми кредами" | tee -a "$LOG_FILE"
+
+    # Используем полные имена для импорта
+    DB_NAME="$FULL_DB_NAME"
+    DB_USER="$FULL_DB_USER"
+    DB_PASS="$NEW_DB_PASS"
 
     # SQL дамп всегда в корне архива, ищем его рекурсивно в RESTORE_DIR и WP_PATH
     echo "Поиск SQL дампа..." | tee -a "$LOG_FILE"
@@ -383,12 +445,17 @@ if [[ "${IS_DONOR,,}" == "true" || "$IS_DONOR" == "1" ]]; then
 
     echo "Найден SQL дамп: $SQL_DUMP" | tee -a "$LOG_FILE"
     if [ -n "$SQL_DUMP" ] && [ -f "$SQL_DUMP" ]; then
-        if ! mariadb -u"$DB_USER" -p"$DB_PASS" "$DB_NAME" < "$SQL_DUMP" >> "$LOG_FILE" 2>&1; then
+        echo "Импортирую SQL дамп в базу данных $DB_NAME..." | tee -a "$LOG_FILE"
+
+        # Используем root доступ для импорта (скрипт запускается от root)
+        if ! mariadb "$DB_NAME" < "$SQL_DUMP" >> "$LOG_FILE" 2>&1; then
             RESTORE_STATUS="error"
             RESTORE_MESSAGE="Ошибка при импорте SQL-дампа"
             send_webhook
             exit 1
         fi
+
+        echo "SQL дамп успешно импортирован" | tee -a "$LOG_FILE"
     else
         RESTORE_STATUS="error"
         RESTORE_MESSAGE="SQL-дамп не найден"
