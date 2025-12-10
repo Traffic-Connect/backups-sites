@@ -1,0 +1,78 @@
+#!/bin/bash
+# info: run User Restore Backup from S3
+# options: BACKUP_URL BACKUP_ID ENVIRONMENT SCHEMA_ID
+#
+# example: v-restore-user-s3 https://s3.example.com/backup.tar 42 example.com 24
+#
+# This function runs restore script for given user backup URL.
+
+#----------------------------------------------------------#
+#                Variables & Functions                     #
+#----------------------------------------------------------#
+
+backup_url=$1
+backup_id=$2
+environment=$3
+schema_id=$4
+
+# Includes
+source /etc/hestiacp/hestia.conf
+source $HESTIA/func/main.sh
+source_conf "$HESTIA/conf/hestia.conf"
+
+#----------------------------------------------------------#
+#                    Logging Setup                         #
+#----------------------------------------------------------#
+
+LOG_ROOT="/backup_restore"
+LOG_DIR="$LOG_ROOT/schema_${schema_id}"
+LOG_FILE="$LOG_DIR/v-restore-user.log"
+
+mkdir -p "$LOG_DIR"
+
+echo "[$(date '+%F %T')] === Starting user restore for schema_${schema_id} ===" >> "$LOG_FILE"
+echo "   BACKUP_URL:  $backup_url" >> "$LOG_FILE"
+echo "   BACKUP_ID:   $backup_id" >> "$LOG_FILE"
+echo "   ENVIRONMENT: $environment" >> "$LOG_FILE"
+echo "   SCHEMA_ID:   $schema_id" >> "$LOG_FILE"
+echo "--------------------------------------------------------" >> "$LOG_FILE"
+
+#----------------------------------------------------------#
+#                       Action                             #
+#----------------------------------------------------------#
+
+# Запускаем восстановление в фоновом режиме
+nohup /usr/local/bin/restore-user-s3.sh "$backup_url" "$backup_id" "$environment" "$schema_id" \
+    >>"$LOG_FILE" 2>&1 &
+
+BACKGROUND_PID=$!
+
+echo "[$(date '+%F %T')] Started background restore process with PID: $BACKGROUND_PID" >> "$LOG_FILE"
+
+#----------------------------------------------------------#
+#                       Hestia                             #
+#----------------------------------------------------------#
+
+log_event "$OK" "$ARGUMENTS"
+RESTORE_STATUS="progress"
+RESTORE_MESSAGE="User backup restore started in background (PID: $BACKGROUND_PID). Status will be sent to webhook when complete."
+echo "[$(date '+%F %T')] Background process started for schema_${schema_id}" >> "$LOG_FILE"
+
+#----------------------------------------------------------#
+#                      JSON Response                       #
+#----------------------------------------------------------#
+
+JSON=$(cat <<EOF
+{
+  "backup_url": "$backup_url",
+  "backup_id": "$backup_id",
+  "schema_id": "$schema_id",
+  "status": "$RESTORE_STATUS",
+  "message": "$RESTORE_MESSAGE",
+  "pid": "$BACKGROUND_PID"
+}
+EOF
+)
+
+echo "$JSON"
+exit 0

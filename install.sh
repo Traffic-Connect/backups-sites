@@ -1,11 +1,12 @@
 #!/bin/bash
-# Скрипт установки зависимостей и команд для бэкапа WordPress
-# VERSION: 1.7
+# Скрипт установки зависимостей и команд для бэкапа WordPress и восстановления пользователей
+# VERSION: 1.9
 
 set -e
 
 echo "=========================================="
-echo "Установка зависимостей для бэкапа WordPress"
+echo "Установка системы бэкапа и восстановления"
+echo "WordPress сайты + Полные бэкапы пользователей"
 echo "=========================================="
 echo ""
 
@@ -94,6 +95,17 @@ if [ ! -f "$CURRENT_DIR/wp-restore-s3.sh" ]; then
     echo "ОШИБКА: Файл wp-restore-s3.sh не найден в текущей директории"
     exit 1
 fi
+
+if [ ! -f "$CURRENT_DIR/v-restore-user-s3" ]; then
+    echo "ОШИБКА: Файл v-restore-user-s3 не найден в текущей директории"
+    exit 1
+fi
+
+if [ ! -f "$CURRENT_DIR/restore-user-s3.sh" ]; then
+    echo "ОШИБКА: Файл restore-user-s3.sh не найден в текущей директории"
+    exit 1
+fi
+
 if [ ! -f "remove-domain.sh" ]; then
     echo "ОШИБКА: Файл remove-domain.sh не найден в текущей директории"
     exit 1
@@ -146,6 +158,22 @@ fi
 cp remove-domain.sh /usr/local/bin/
 chmod +x /usr/local/bin/remove-domain.sh
 echo "  remove-domain.sh установлен в /usr/local/bin/"
+
+# Копирование команды Hestia для восстановления пользователя
+if [ -f "/usr/local/hestia/bin/v-restore-user-s3" ]; then
+    echo "  v-restore-user-s3 уже существует, перезаписываем..."
+fi
+cp "$CURRENT_DIR/v-restore-user-s3" /usr/local/hestia/bin/
+chmod +x /usr/local/hestia/bin/v-restore-user-s3
+echo "  v-restore-user-s3 установлен в /usr/local/hestia/bin/"
+
+# Копирование основного скрипта восстановления пользователя
+if [ -f "/usr/local/bin/restore-user-s3.sh" ]; then
+    echo "  restore-user-s3.sh уже существует, перезаписываем..."
+fi
+cp "$CURRENT_DIR/restore-user-s3.sh" /usr/local/bin/
+chmod +x /usr/local/bin/restore-user-s3.sh
+echo "  restore-user-s3.sh установлен в /usr/local/bin/"
 
 # Создание директории для бэкапов
 mkdir -p /backup
@@ -305,9 +333,11 @@ echo ""
 echo "Установленные команды:"
 echo "  - /usr/local/hestia/bin/v-wp-backup-s3"
 echo "  - /usr/local/hestia/bin/v-wp-restore-s3"
+echo "  - /usr/local/hestia/bin/v-restore-user-s3"
 echo "  - /usr/local/hestia/bin/v-check-file-exists"
 echo "  - /usr/local/bin/wp-backup-s3.sh"
 echo "  - /usr/local/bin/wp-restore-s3.sh"
+echo "  - /usr/local/bin/restore-user-s3.sh"
 echo "  - /usr/local/bin/remove-domain.sh"
 echo "  - /usr/local/bin/wp-backup-auto-update.sh"
 echo ""
@@ -319,12 +349,19 @@ echo ""
 echo "Следующий шаг - настройка AWS CLI:"
 echo "  aws configure"
 echo ""
-echo "Тестирование:"
+echo "Тестирование WordPress бэкапа:"
 echo "  /usr/local/bin/wp-backup-s3.sh example.com"
+echo ""
+echo "Восстановление WordPress сайта:"
+echo "  v-wp-restore-s3 example.com \"https://s3.example.com/backup.tar\" 42 17 true manager.example.com 24"
+echo ""
+echo "Восстановление полного бэкапа пользователя:"
+echo "  v-restore-user-s3 \"https://s3.example.com/user.tar\" 42 manager.example.com 24"
 echo ""
 echo "Ручная проверка обновлений:"
 echo "  /usr/local/bin/wp-backup-auto-update.sh"
 echo ""
-echo "Просмотр логов автообновления:"
+echo "Просмотр логов:"
 echo "  tail -f /var/log/wp-backup-auto-update.log"
+echo "  tail -f /backup_restore/schema_21/restore-user.log"
 echo ""
