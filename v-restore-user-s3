@@ -15,6 +15,22 @@ backup_id=$2
 environment=$3
 schema_id=$4
 
+# Функция для вывода JSON ответа с ошибкой
+error_response() {
+    local error_message="$1"
+    cat <<EOF
+{
+  "backup_url": "$backup_url",
+  "backup_id": "$backup_id",
+  "schema_id": "$schema_id",
+  "status": "error",
+  "message": "$error_message",
+  "pid": null
+}
+EOF
+    exit 1
+}
+
 # Includes
 source /etc/hestiacp/hestia.conf
 source $HESTIA/func/main.sh
@@ -28,7 +44,15 @@ LOG_ROOT="/backup_restore"
 LOG_DIR="$LOG_ROOT/schema_${schema_id}"
 LOG_FILE="$LOG_DIR/v-restore-user.log"
 
-mkdir -p "$LOG_DIR"
+# Проверяем, что все параметры переданы
+if [ -z "$backup_url" ] || [ -z "$backup_id" ] || [ -z "$environment" ] || [ -z "$schema_id" ]; then
+    error_response "Missing required parameters: backup_url=${backup_url:-empty}, backup_id=${backup_id:-empty}, environment=${environment:-empty}, schema_id=${schema_id:-empty}"
+fi
+
+# Пытаемся создать директорию с обработкой ошибок
+if ! mkdir -p "$LOG_DIR" 2>/dev/null; then
+    error_response "Failed to create directory $LOG_DIR. Check permissions for creating /backup_restore"
+fi
 
 echo "[$(date '+%F %T')] === Starting user restore for schema_${schema_id} ===" >> "$LOG_FILE"
 echo "   BACKUP_URL:  $backup_url" >> "$LOG_FILE"
@@ -41,13 +65,33 @@ echo "--------------------------------------------------------" >> "$LOG_FILE"
 #                       Action                             #
 #----------------------------------------------------------#
 
+# Проверяем существование скрипта восстановления
+RESTORE_SCRIPT="/usr/local/bin/restore-user-s3.sh"
+if [ ! -f "$RESTORE_SCRIPT" ]; then
+    echo "[$(date '+%F %T')] ERROR: Restore script not found at $RESTORE_SCRIPT" >> "$LOG_FILE" 2>/dev/null || true
+    error_response "Restore script not found at $RESTORE_SCRIPT"
+fi
+
+if [ ! -x "$RESTORE_SCRIPT" ]; then
+    echo "[$(date '+%F %T')] ERROR: Restore script is not executable: $RESTORE_SCRIPT" >> "$LOG_FILE"
+    error_response "Restore script is not executable: $RESTORE_SCRIPT"
+fi
+
 # Запускаем восстановление в фоновом режиме
-nohup /usr/local/bin/restore-user-s3.sh "$backup_url" "$backup_id" "$environment" "$schema_id" \
+echo "[$(date '+%F %T')] Starting background restore process..." >> "$LOG_FILE"
+nohup "$RESTORE_SCRIPT" "$backup_url" "$backup_id" "$environment" "$schema_id" \
     >>"$LOG_FILE" 2>&1 &
 
 BACKGROUND_PID=$!
 
-echo "[$(date '+%F %T')] Started background restore process with PID: $BACKGROUND_PID" >> "$LOG_FILE"
+# Проверяем, что процесс действительно запустился
+sleep 1
+if ps -p $BACKGROUND_PID > /dev/null 2>&1; then
+    echo "[$(date '+%F %T')] Background restore process started successfully with PID: $BACKGROUND_PID" >> "$LOG_FILE"
+else
+    echo "[$(date '+%F %T')] ERROR: Background process failed to start or crashed immediately" >> "$LOG_FILE"
+    error_response "Background restore process failed to start or crashed immediately. Check $LOG_FILE for details"
+fi
 
 #----------------------------------------------------------#
 #                       Hestia                             #
