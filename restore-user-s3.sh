@@ -150,31 +150,31 @@ fi
 
 log_progress "✓ Файл прошел проверку целостности"
 
-# === Проверяем, существует ли целевой пользователь ===
-if v-list-user "$SCHEMA_USER" >/dev/null 2>&1; then
-    log_progress "Пользователь $SCHEMA_USER уже существует. Удаляю перед восстановлением..."
-
-    # Удаляем существующего пользователя
-    if ! v-delete-user "$SCHEMA_USER" yes >> "$LOG_FILE" 2>&1; then
-        echo "Предупреждение: не удалось удалить существующего пользователя $SCHEMA_USER" | tee -a "$LOG_FILE"
-    else
-        log_progress "Пользователь $SCHEMA_USER успешно удален"
-    fi
-fi
-
-# === Создаем нового пользователя ===
-log_progress "Создаю пользователя $SCHEMA_USER..."
-USER_PASSWORD=$(openssl rand -base64 16)
-USER_EMAIL="schema_${SCHEMA_ID}@tcnct.com"
-
-if ! v-add-user "$SCHEMA_USER" "$USER_PASSWORD" "$USER_EMAIL" >> "$LOG_FILE" 2>&1; then
-    RESTORE_STATUS="error"
-    RESTORE_MESSAGE="Ошибка: не удалось создать пользователя $SCHEMA_USER"
-    send_webhook
-    exit 1
-fi
-
-log_progress "Пользователь $SCHEMA_USER успешно создан"
+## === Проверяем, существует ли целевой пользователь ===
+#if v-list-user "$SCHEMA_USER" >/dev/null 2>&1; then
+#    log_progress "Пользователь $SCHEMA_USER уже существует. Удаляю перед восстановлением..."
+#
+#    # Удаляем существующего пользователя
+#    if ! v-delete-user "$SCHEMA_USER" yes >> "$LOG_FILE" 2>&1; then
+#        echo "Предупреждение: не удалось удалить существующего пользователя $SCHEMA_USER" | tee -a "$LOG_FILE"
+#    else
+#        log_progress "Пользователь $SCHEMA_USER успешно удален"
+#    fi
+#fi
+#
+## === Создаем нового пользователя ===
+#log_progress "Создаю пользователя $SCHEMA_USER..."
+#USER_PASSWORD=$(openssl rand -base64 16)
+#USER_EMAIL="schema_${SCHEMA_ID}@tcnct.com"
+#
+#if ! v-add-user "$SCHEMA_USER" "$USER_PASSWORD" "$USER_EMAIL" >> "$LOG_FILE" 2>&1; then
+#    RESTORE_STATUS="error"
+#    RESTORE_MESSAGE="Ошибка: не удалось создать пользователя $SCHEMA_USER"
+#    send_webhook
+#    exit 1
+#fi
+#
+#log_progress "Пользователь $SCHEMA_USER успешно создан"
 
 # === Проверка содержимого архива ===
 log_progress "Проверка структуры архива..."
