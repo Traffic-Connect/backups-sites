@@ -6,7 +6,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="v8"
+VERSION="v9"
 
 export PATH=$PATH:/usr/local/hestia/bin
 
@@ -67,16 +67,27 @@ JSON
 ) >> "$LOG_FILE" 2>&1 || true
 }
 
+# === Функция логирования с отправкой webhook о прогрессе ===
+log_progress() {
+    local message="$1"
+    echo "$message" | tee -a "$LOG_FILE"
+
+    # Отправляем webhook о прогрессе
+    RESTORE_STATUS="progress"
+    RESTORE_MESSAGE="$message"
+    send_webhook
+}
+
 # === Определяем пользователя на основе scheme_id ===
 SCHEMA_USER="schema_${SCHEME_ID}"
 REMOVE_SCRIPT="/usr/local/bin/remove-domain.sh"
 
 # Проверяем существование пользователя schema_{scheme_id}
 if v-list-user "$SCHEMA_USER" >/dev/null 2>&1; then
-    echo "Пользователь $SCHEMA_USER уже существует" | tee -a "$LOG_FILE"
+    log_progress "Пользователь $SCHEMA_USER уже существует"
     USER="$SCHEMA_USER"
 else
-    echo "Пользователь $SCHEMA_USER не найден. Создаю..." | tee -a "$LOG_FILE"
+    log_progress "Пользователь $SCHEMA_USER не найден. Создаю..."
 
     # Генерируем случайный пароль для нового пользователя
     USER_PASSWORD=$(openssl rand -base64 16)
@@ -94,7 +105,7 @@ else
         send_webhook
         exit 1
     else
-        echo "Пользователь $SCHEMA_USER успешно создан" | tee -a "$LOG_FILE"
+        log_progress "Пользователь $SCHEMA_USER успешно создан"
         USER="$SCHEMA_USER"
     fi
 fi
@@ -104,9 +115,9 @@ EXISTING_OWNER=$(v-search-domain-owner "$DOMAIN" plain 2>/dev/null | awk '{print
 
 if [ -n "$EXISTING_OWNER" ]; then
     if [ "$EXISTING_OWNER" != "$USER" ]; then
-        echo "Домен $DOMAIN найден у другого пользователя ($EXISTING_OWNER). Удаляю..." | tee -a "$LOG_FILE"
+        log_progress "Домен $DOMAIN найден у другого пользователя ($EXISTING_OWNER). Удаляю..."
     else
-        echo "Домен $DOMAIN уже существует у пользователя $USER. Пересоздаю..." | tee -a "$LOG_FILE"
+        log_progress "Домен $DOMAIN уже существует у пользователя $USER. Пересоздаю..."
     fi
 
     # --- Удаляем старый домен ---
@@ -117,19 +128,19 @@ if [ -n "$EXISTING_OWNER" ]; then
     # Пробуем удалить через v-delete-domain у найденного владельца
     v-delete-domain "$EXISTING_OWNER" "$DOMAIN" >> "$LOG_FILE" 2>&1 || true
 else
-    echo "Домен $DOMAIN не найден через v-search-domain-owner. Проверяю наличие домена в системе..." | tee -a "$LOG_FILE"
+    log_progress "Домен $DOMAIN не найден. Проверяю наличие домена в системе..."
 
     # Ищем домен у всех пользователей
     ALL_USERS=$(v-list-users plain | awk '{print $1}')
     for CHECK_USER in $ALL_USERS; do
         if v-list-web-domain "$CHECK_USER" "$DOMAIN" >/dev/null 2>&1; then
-            echo "Найден домен $DOMAIN у пользователя $CHECK_USER. Удаляю..." | tee -a "$LOG_FILE"
+            log_progress "Найден домен $DOMAIN у пользователя $CHECK_USER. Удаляю..."
             v-delete-domain "$CHECK_USER" "$DOMAIN" >> "$LOG_FILE" 2>&1 || true
             break
         fi
     done
 
-    echo "Создаю домен для пользователя $USER..." | tee -a "$LOG_FILE"
+    log_progress "Создаю домен для пользователя $USER..."
 fi
 
 # --- Проверяем и удаляем папку домена, если она существует ---
@@ -154,7 +165,7 @@ if [ -f "$HESTIA_DOMAIN_CONF" ]; then
 fi
 
 # --- Создаём домен (только WEB, без DNS и MAIL) ---
-echo "Попытка создать домен $DOMAIN для пользователя $USER..." | tee -a "$LOG_FILE"
+log_progress "Создаю домен $DOMAIN для пользователя $USER..."
 DOMAIN_CREATE_OUTPUT=$(v-add-web-domain "$USER" "$DOMAIN" 2>&1) || DOMAIN_CREATE_FAILED=$?
 
 if [ "${DOMAIN_CREATE_FAILED:-0}" -ne 0 ]; then
@@ -168,10 +179,10 @@ if [ "${DOMAIN_CREATE_FAILED:-0}" -ne 0 ]; then
         exit 1
     fi
 else
-    echo "Домен $DOMAIN успешно создан." | tee -a "$LOG_FILE"
+    log_progress "Домен $DOMAIN успешно создан"
 
     # Меняем шаблон прокси на tc-nginx-only
-    echo "Изменяю прокси шаблон на tc-nginx-only..." | tee -a "$LOG_FILE"
+    log_progress "Изменяю прокси шаблон на tc-nginx-only..."
     v-change-web-domain-proxy-tpl "$USER" "$DOMAIN" "tc-nginx-only" >> "$LOG_FILE" 2>&1 || {
         echo "Предупреждение: не удалось изменить прокси шаблон" | tee -a "$LOG_FILE"
     }
@@ -190,7 +201,7 @@ AWS_REGION=$(echo "$CREDS" | jq -r '.data.B2_REGION')
 AWS_ENDPOINT=$(echo "$CREDS" | jq -r '.data.B2_ENDPOINT')
 export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION="$AWS_REGION"
 
-echo "Восстановление из архива: $FULL_S3_PATH" | tee -a "$LOG_FILE"
+log_progress "Начинаю скачивание архива: $FULL_S3_PATH"
 
 cd "$RESTORE_DIR" || {
     RESTORE_STATUS="error"
@@ -201,7 +212,7 @@ cd "$RESTORE_DIR" || {
 
 # === Определяем способ скачивания ===
 if [[ "$FULL_S3_PATH" == s3://* ]]; then
-    echo "Тип ссылки: S3 (через AWS CLI)" | tee -a "$LOG_FILE"
+    log_progress "Скачивание архива из S3 (через AWS CLI)..."
     if ! aws --endpoint-url "$AWS_ENDPOINT" s3 cp "$FULL_S3_PATH" . --no-progress --only-show-errors >> "$LOG_FILE" 2>&1; then
         RESTORE_STATUS="error"
         RESTORE_MESSAGE="Ошибка: архив не найден в S3 ($FULL_S3_PATH)"
@@ -210,7 +221,7 @@ if [[ "$FULL_S3_PATH" == s3://* ]]; then
         exit 1
     fi
 else
-    echo "Тип ссылки: HTTPS (прямая загрузка)" | tee -a "$LOG_FILE"
+    log_progress "Скачивание архива по HTTPS (прямая загрузка)..."
     BACKUP_FILE=$(basename "$FULL_S3_PATH")
     if ! curl -L -o "$BACKUP_FILE" "$FULL_S3_PATH" >> "$LOG_FILE" 2>&1; then
         RESTORE_STATUS="error"
@@ -229,6 +240,8 @@ if [ ! -f "$RESTORE_DIR/$BACKUP_FILE" ]; then
     exit 1
 fi
 
+log_progress "Архив успешно скачан: $BACKUP_FILE"
+
 # === Очистка и подготовка каталога ===
 if [ -d "$WP_PATH" ]; then
     rm -rf "$WP_PATH"/* || true
@@ -237,7 +250,7 @@ else
 fi
 
 # === Определяем тип архива и распаковываем ===
-echo "Распаковка архива: $BACKUP_FILE" | tee -a "$LOG_FILE"
+log_progress "Распаковка архива: $BACKUP_FILE"
 EXTRACT_ERROR=0
 
 if [[ "$BACKUP_FILE" == *.tar.gz ]]; then
@@ -247,7 +260,7 @@ if [[ "$BACKUP_FILE" == *.tar.gz ]]; then
         echo "$RESTORE_MESSAGE" | tee -a "$LOG_FILE"
         EXTRACT_ERROR=1
     else
-        echo "Архив успешно распакован (tar.gz)" | tee -a "$LOG_FILE"
+        log_progress "Архив успешно распакован (tar.gz)"
     fi
 elif [[ "$BACKUP_FILE" == *.zip ]]; then
     if ! unzip -q -o "$BACKUP_FILE" -d "$WP_PATH" >> "$LOG_FILE" 2>&1; then
@@ -257,7 +270,7 @@ elif [[ "$BACKUP_FILE" == *.zip ]]; then
         echo "Подробности: $(tail -20 "$LOG_FILE")" | tee -a "$LOG_FILE"
         EXTRACT_ERROR=1
     else
-        echo "Архив успешно распакован (zip)" | tee -a "$LOG_FILE"
+        log_progress "Архив успешно распакован (zip)"
     fi
 else
     RESTORE_STATUS="error"
@@ -278,13 +291,13 @@ if [ $EXTRACT_ERROR -eq 1 ]; then
 fi
 
 # === Устанавливаем правильного владельца файлов ===
-echo "Устанавливаю владельца файлов для текущего домена: $USER:$USER..." | tee -a "$LOG_FILE"
+log_progress "Устанавливаю владельца файлов для домена: $USER:$USER..."
 chown -R "$USER":"$USER" "$WP_PATH" >> "$LOG_FILE" 2>&1 || {
     echo "Предупреждение: не удалось установить владельца файлов" | tee -a "$LOG_FILE"
 }
 
 # === Исправляем права для всех остальных доменов этого пользователя ===
-echo "Проверяю и исправляю права для всех доменов пользователя $USER..." | tee -a "$LOG_FILE"
+log_progress "Проверяю и исправляю права для всех доменов пользователя $USER..."
 USER_WEB_PATH="/home/$USER/web"
 if [ -d "$USER_WEB_PATH" ]; then
     for DOMAIN_DIR in "$USER_WEB_PATH"/*/ ; do
@@ -294,19 +307,19 @@ if [ -d "$USER_WEB_PATH" ]; then
             chown -R "$USER":"$USER" "$DOMAIN_DIR" >> "$LOG_FILE" 2>&1 || true
         fi
     done
-    echo "Права для всех доменов пользователя $USER исправлены" | tee -a "$LOG_FILE"
+    log_progress "Права для всех доменов пользователя $USER исправлены"
 fi
 
 # === Если это WordPress-сайт ===
 if [[ "${IS_DONOR,,}" == "true" || "$IS_DONOR" == "1" ]]; then
-    echo "Режим: WordPress (донор)" | tee -a "$LOG_FILE"
+    log_progress "Режим: WordPress (донор) - начинаю настройку WordPress"
 
     # === Автоматическое определение местоположения WordPress ===
     CONFIG="$WP_PATH/wp-config.php"
 
     # Если wp-config.php не в корне, ищем его в подпапках
     if [ ! -f "$CONFIG" ]; then
-        echo "wp-config.php не найден в корне, ищу в подпапках..." | tee -a "$LOG_FILE"
+        log_progress "wp-config.php не найден в корне, ищу в подпапках..."
 
         # Ищем первый найденный wp-config.php
         FOUND_CONFIG=$(find "$WP_PATH" -maxdepth 2 -name "wp-config.php" -type f | head -n 1 || true)
@@ -316,12 +329,12 @@ if [[ "${IS_DONOR,,}" == "true" || "$IS_DONOR" == "1" ]]; then
             # Определяем папку, где находится WordPress
             WP_SUBDIR=$(dirname "$FOUND_CONFIG" | sed "s|$WP_PATH||" | sed 's|^/||')
             if [ -n "$WP_SUBDIR" ]; then
-                echo "WordPress найден в подпапке: $WP_SUBDIR" | tee -a "$LOG_FILE"
+                log_progress "WordPress найден в подпапке: $WP_SUBDIR"
                 WP_PATH="$WP_PATH/$WP_SUBDIR"
 
                 # Меняем document root для веб-сервера
                 # Формат: v-change-web-domain-docroot USER DOMAIN TARGET_DOMAIN [DIRECTORY]
-                echo "Изменяю document root на подпапку: $WP_SUBDIR" | tee -a "$LOG_FILE"
+                log_progress "Изменяю document root на подпапку: $WP_SUBDIR"
                 echo "Выполняю: v-change-web-domain-docroot $USER $DOMAIN $DOMAIN $WP_SUBDIR" | tee -a "$LOG_FILE"
 
                 DOCROOT_OUTPUT=$(v-change-web-domain-docroot "$USER" "$DOMAIN" "$DOMAIN" "$WP_SUBDIR" 2>&1) || DOCROOT_FAILED=$?
@@ -331,7 +344,7 @@ if [[ "${IS_DONOR,,}" == "true" || "$IS_DONOR" == "1" ]]; then
                     echo "Вывод команды: $DOCROOT_OUTPUT" | tee -a "$LOG_FILE"
                     echo "Предупреждение: не удалось изменить document root" | tee -a "$LOG_FILE"
                 else
-                    echo "Document root успешно изменен на подпапку: $WP_SUBDIR" | tee -a "$LOG_FILE"
+                    log_progress "Document root успешно изменен на подпапку: $WP_SUBDIR"
                     echo "Вывод команды: $DOCROOT_OUTPUT" | tee -a "$LOG_FILE"
                 fi
             fi
@@ -361,7 +374,7 @@ if [[ "${IS_DONOR,,}" == "true" || "$IS_DONOR" == "1" ]]; then
         exit 1
     fi
 
-    echo "Импорт базы данных..." | tee -a "$LOG_FILE"
+    log_progress "Начинаю импорт базы данных..."
     echo "Старое имя БД из wp-config.php: $OLD_DB_NAME" | tee -a "$LOG_FILE"
     echo "Старый пользователь БД из wp-config.php: $OLD_DB_USER" | tee -a "$LOG_FILE"
 
@@ -388,7 +401,7 @@ if [[ "${IS_DONOR,,}" == "true" || "$IS_DONOR" == "1" ]]; then
 
     # Создаём базу данных через HestiaCP (используем короткое имя, HestiaCP добавит префикс)
     # Уникальное имя гарантирует отсутствие конфликтов
-    echo "Создаю базу данных $SHORT_DB_NAME через v-add-database..." | tee -a "$LOG_FILE"
+    log_progress "Создаю базу данных $SHORT_DB_NAME через v-add-database..."
     DB_CREATE_OUTPUT=$(v-add-database "$USER" "$SHORT_DB_NAME" "$SHORT_DB_USER" "$NEW_DB_PASS" "mysql" "localhost" "utf8mb4" 2>&1) || DB_CREATE_FAILED=$?
 
     if [ "${DB_CREATE_FAILED:-0}" -ne 0 ]; then
@@ -399,7 +412,7 @@ if [[ "${IS_DONOR,,}" == "true" || "$IS_DONOR" == "1" ]]; then
         send_webhook
         exit 1
     else
-        echo "База данных $SHORT_DB_NAME успешно создана" | tee -a "$LOG_FILE"
+        log_progress "База данных $SHORT_DB_NAME успешно создана"
     fi
 
     # HestiaCP добавляет префикс USER_ к имени БД и пользователя, формируем полные имена
@@ -409,7 +422,7 @@ if [[ "${IS_DONOR,,}" == "true" || "$IS_DONOR" == "1" ]]; then
     echo "Полное имя пользователя БД с префиксом: $FULL_DB_USER" | tee -a "$LOG_FILE"
 
     # Обновляем wp-config.php с новыми кредами БД
-    echo "Обновляю wp-config.php с новыми кредами БД..." | tee -a "$LOG_FILE"
+    log_progress "Обновляю wp-config.php с новыми кредами БД..."
 
     # Обновляем DB_NAME (используем | как разделитель вместо /)
     sed -i "s|define([[:space:]]*['\"]DB_NAME['\"][[:space:]]*,[[:space:]]*['\"][^'\"]*['\"][[:space:]]*);|define('DB_NAME', '$FULL_DB_NAME');|" "$CONFIG"
@@ -420,7 +433,7 @@ if [[ "${IS_DONOR,,}" == "true" || "$IS_DONOR" == "1" ]]; then
     # Обновляем DB_PASSWORD
     sed -i "s|define([[:space:]]*['\"]DB_PASSWORD['\"][[:space:]]*,[[:space:]]*['\"][^'\"]*['\"][[:space:]]*);|define('DB_PASSWORD', '$NEW_DB_PASS');|" "$CONFIG"
 
-    echo "wp-config.php обновлён с новыми кредами" | tee -a "$LOG_FILE"
+    log_progress "wp-config.php обновлён с новыми кредами"
 
     # Используем полные имена для импорта
     DB_NAME="$FULL_DB_NAME"
@@ -428,7 +441,7 @@ if [[ "${IS_DONOR,,}" == "true" || "$IS_DONOR" == "1" ]]; then
     DB_PASS="$NEW_DB_PASS"
 
     # SQL дамп всегда в корне архива, ищем его рекурсивно в RESTORE_DIR и WP_PATH
-    echo "Поиск SQL дампа..." | tee -a "$LOG_FILE"
+    log_progress "Поиск SQL дампа..."
     SQL_DUMP=$(find "$RESTORE_DIR" -type f \( -name "*.sql" -o -name "*.sql.gz" \) 2>/dev/null | head -n 1 || true)
 
     # Если не найден в RESTORE_DIR, ищем в WP_PATH (где распакован архив)
@@ -445,7 +458,7 @@ if [[ "${IS_DONOR,,}" == "true" || "$IS_DONOR" == "1" ]]; then
 
     echo "Найден SQL дамп: $SQL_DUMP" | tee -a "$LOG_FILE"
     if [ -n "$SQL_DUMP" ] && [ -f "$SQL_DUMP" ]; then
-        echo "Импортирую SQL дамп в базу данных $DB_NAME..." | tee -a "$LOG_FILE"
+        log_progress "Импортирую SQL дамп в базу данных $DB_NAME..."
 
         # Используем root доступ для импорта (скрипт запускается от root)
         if ! mariadb "$DB_NAME" < "$SQL_DUMP" >> "$LOG_FILE" 2>&1; then
@@ -455,7 +468,7 @@ if [[ "${IS_DONOR,,}" == "true" || "$IS_DONOR" == "1" ]]; then
             exit 1
         fi
 
-        echo "SQL дамп успешно импортирован" | tee -a "$LOG_FILE"
+        log_progress "SQL дамп успешно импортирован в базу данных"
     else
         RESTORE_STATUS="error"
         RESTORE_MESSAGE="SQL-дамп не найден"
@@ -463,19 +476,24 @@ if [[ "${IS_DONOR,,}" == "true" || "$IS_DONOR" == "1" ]]; then
         exit 1
     fi
 else
-    echo "Режим: HTML-сайт (не донор) — база данных не восстанавливается." | tee -a "$LOG_FILE"
+    log_progress "Режим: HTML-сайт (не донор) — база данных не восстанавливается"
 fi
 
 # === Пересборка Hestia и отправка webhook ===
+log_progress "Пересборка конфигурации веб-доменов и обновление статистики..."
 v-rebuild-web-domains "$USER" >/dev/null 2>&1 || true
 v-update-user-stats "$USER" >/dev/null 2>&1 || true
 
 # === Удаляем архив при успешном восстановлении ===
+log_progress "Очистка временных файлов..."
 if [ -f "$RESTORE_DIR/$BACKUP_FILE" ]; then
     rm -f "$RESTORE_DIR/$BACKUP_FILE"
     echo "Архив удалён: $BACKUP_FILE" | tee -a "$LOG_FILE"
 fi
 
+# === Устанавливаем финальный статус успеха ===
+RESTORE_STATUS="done"
+RESTORE_MESSAGE="Восстановление домена $DOMAIN выполнено успешно"
 send_webhook
 echo "=== End restore $DOMAIN at $(date '+%F %T') ===" | tee -a "$LOG_FILE"
 exit 0
