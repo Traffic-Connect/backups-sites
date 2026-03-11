@@ -31,10 +31,17 @@ BACKUP_FILE=$(basename "$FULL_S3_PATH")
 RESTORE_STATUS="done"
 RESTORE_MESSAGE="Восстановление выполнено успешно"
 
+# Директории для логов и для бэкапов
 LOG_ROOT="/backup_restore"
-RESTORE_DIR="$LOG_ROOT/$DOMAIN"
-mkdir -p "$RESTORE_DIR"
-LOG_FILE="$RESTORE_DIR/restore.log"
+LOG_DIR="$LOG_ROOT/$DOMAIN"
+BACKUP_DIR="/backup"
+
+# Создаем директории
+mkdir -p "$LOG_DIR"
+mkdir -p "$BACKUP_DIR"
+
+# Логи в /backup_restore/$DOMAIN/, архив будет в /backup/
+LOG_FILE="$LOG_DIR/restore.log"
 echo "=== Start restore $DOMAIN at $(date '+%F %T') ===" > "$LOG_FILE"
 
 echo "→ DOMAIN: $DOMAIN"
@@ -109,9 +116,9 @@ export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_DEFAULT_REGION="$AWS_REGION"
 
 log_progress "Начинаю скачивание архива: $FULL_S3_PATH"
 
-cd "$RESTORE_DIR" || {
+cd "$BACKUP_DIR" || {
     RESTORE_STATUS="error"
-    RESTORE_MESSAGE="Ошибка: не удалось перейти в каталог $RESTORE_DIR"
+    RESTORE_MESSAGE="Ошибка: не удалось перейти в каталог $BACKUP_DIR"
     send_webhook
     exit 1
 }
@@ -128,7 +135,7 @@ if [[ "$FULL_S3_PATH" == s3://* ]]; then
     echo "Размер файла в S3: $TOTAL_SIZE байт" | tee -a "$LOG_FILE"
 
     # Запускаем скачивание в фоне
-    DOWNLOAD_FILE="$RESTORE_DIR/$BACKUP_FILE"
+    DOWNLOAD_FILE="$BACKUP_DIR/$BACKUP_FILE"
     echo "Скачиваю в: $DOWNLOAD_FILE" | tee -a "$LOG_FILE"
 
     # Создаем временный файл для вывода AWS CLI
@@ -319,7 +326,7 @@ EOF
     else
         echo "ВНИМАНИЕ: Финальный файл не найден: $DOWNLOAD_FILE" | tee -a "$LOG_FILE"
         echo "Список файлов в директории:" | tee -a "$LOG_FILE"
-        ls -lh "$RESTORE_DIR/" | tee -a "$LOG_FILE"
+        ls -lh "$BACKUP_DIR/" | tee -a "$LOG_FILE"
 
         # Проверяем, остался ли временный файл
         if [ -n "$TEMP_FILE" ] && [ -f "$TEMP_FILE" ]; then
@@ -352,7 +359,7 @@ else
 fi
 
 # === Проверка результата скачивания ===
-if [ ! -f "$RESTORE_DIR/$BACKUP_FILE" ]; then
+if [ ! -f "$BACKUP_DIR/$BACKUP_FILE" ]; then
     RESTORE_STATUS="error"
     RESTORE_MESSAGE="Ошибка: архив не скачан"
     echo "$RESTORE_MESSAGE" | tee -a "$LOG_FILE"
@@ -366,73 +373,145 @@ log_progress "Архив успешно скачан: $BACKUP_FILE"
 log_progress "Проверяю формат архива..."
 
 # Проверяем тип файла
-ARCHIVE_INFO=$(file "$RESTORE_DIR/$BACKUP_FILE" 2>&1)
+ARCHIVE_INFO=$(file -b "$BACKUP_DIR/$BACKUP_FILE")
 echo "Тип файла: $ARCHIVE_INFO" | tee -a "$LOG_FILE"
+
+# Проверяем, что это tar архив
+if ! echo "$ARCHIVE_INFO" | grep -qi "tar\|compressed"; then
+    echo "✗ ОШИБКА: Скачанный файл не является tar архивом!" | tee -a "$LOG_FILE"
+    echo "Возможно, URL истек или произошла ошибка при скачивании." | tee -a "$LOG_FILE"
+    echo "Первые 500 байт файла:" | tee -a "$LOG_FILE"
+    head -c 500 "$BACKUP_DIR/$BACKUP_FILE" | tee -a "$LOG_FILE"
+
+    RESTORE_STATUS="error"
+    RESTORE_MESSAGE="Ошибка: Скачанный файл не является tar архивом. Тип: $ARCHIVE_INFO"
+    send_webhook
+    exit 1
+fi
+
+log_progress "✓ Файл прошел проверку целостности"
 
 # Проверяем содержимое архива
 echo "Проверяю структуру архива..." | tee -a "$LOG_FILE"
-ARCHIVE_CONTENTS=$(tar -tf "$RESTORE_DIR/$BACKUP_FILE" 2>/dev/null | head -20 || echo "")
-echo "Первые 20 файлов в архиве:" | tee -a "$LOG_FILE"
-echo "$ARCHIVE_CONTENTS" | tee -a "$LOG_FILE"
 
-# Проверяем, является ли это tar архивом с zstd компрессией
-if echo "$ARCHIVE_INFO" | grep -q "Zstandard compressed"; then
-    echo "Обнаружен Zstandard compressed data" | tee -a "$LOG_FILE"
-
-    # v-restore-user не распознает .tar с zstd внутри
-    # Переименовываем в .tar.zst для правильного определения формата
-    if [[ "$BACKUP_FILE" != *.tar.zst ]]; then
-        NEW_BACKUP_FILE="${BACKUP_FILE}.zst"
-        echo "Переименовываю $BACKUP_FILE -> $NEW_BACKUP_FILE для v-restore-user" | tee -a "$LOG_FILE"
-        mv "$RESTORE_DIR/$BACKUP_FILE" "$RESTORE_DIR/$NEW_BACKUP_FILE"
-        BACKUP_FILE="$NEW_BACKUP_FILE"
-    fi
-elif echo "$ARCHIVE_INFO" | grep -q "POSIX tar archive"; then
-    echo "Обнаружен обычный tar архив (без компрессии)" | tee -a "$LOG_FILE"
-
-    # Проверяем, есть ли маркер HestiaCP внутри архива
-    if echo "$ARCHIVE_CONTENTS" | grep -q "hestia/user.conf"; then
-        echo "Найден маркер HestiaCP: hestia/user.conf" | tee -a "$LOG_FILE"
-    elif echo "$ARCHIVE_CONTENTS" | grep -q ".zstd"; then
-        echo "Найден маркер .zstd - архив использует zstd компрессию внутри" | tee -a "$LOG_FILE"
-        # Это tar архив, внутри которого файлы в zstd
-        # v-restore-user должен уметь работать с таким форматом
-    else
-        echo "ВНИМАНИЕ: Структура архива не соответствует ожидаемой!" | tee -a "$LOG_FILE"
-        echo "Проверяю, не вложенный ли это архив..." | tee -a "$LOG_FILE"
-
-        # Возможно, это tar внутри tar - распаковываем и проверяем
-        TEMP_EXTRACT_DIR="$RESTORE_DIR/temp_extract"
-        mkdir -p "$TEMP_EXTRACT_DIR"
-
-        if tar -xf "$RESTORE_DIR/$BACKUP_FILE" -C "$TEMP_EXTRACT_DIR" 2>&1 | tee -a "$LOG_FILE"; then
-            echo "Архив распакован в: $TEMP_EXTRACT_DIR" | tee -a "$LOG_FILE"
-            ls -la "$TEMP_EXTRACT_DIR" | tee -a "$LOG_FILE"
-
-            # Ищем вложенные архивы или структуру HestiaCP
-            NESTED_ARCHIVES=$(find "$TEMP_EXTRACT_DIR" -maxdepth 2 -name "*.tar*" -o -name ".zstd" | head -5)
-            if [ -n "$NESTED_ARCHIVES" ]; then
-                echo "Найдены вложенные структуры:" | tee -a "$LOG_FILE"
-                echo "$NESTED_ARCHIVES" | tee -a "$LOG_FILE"
-            fi
-
-            # Очищаем временную директорию
-            rm -rf "$TEMP_EXTRACT_DIR"
-        fi
-    fi
+# Определяем опции tar в зависимости от типа архива
+TAR_OPTS="-tf"
+if echo "$ARCHIVE_INFO" | grep -qi "gzip"; then
+    TAR_OPTS="-tzf"
+    echo "Тип сжатия: gzip" | tee -a "$LOG_FILE"
+elif echo "$ARCHIVE_INFO" | grep -qi "bzip2"; then
+    TAR_OPTS="-tjf"
+    echo "Тип сжатия: bzip2" | tee -a "$LOG_FILE"
+elif echo "$ARCHIVE_INFO" | grep -qi "xz"; then
+    TAR_OPTS="-tJf"
+    echo "Тип сжатия: xz" | tee -a "$LOG_FILE"
+elif echo "$ARCHIVE_INFO" | grep -qi "zstandard"; then
+    TAR_OPTS="--zstd -tf"
+    echo "Тип сжатия: zstandard" | tee -a "$LOG_FILE"
 else
-    echo "ВНИМАНИЕ: Неизвестный формат архива!" | tee -a "$LOG_FILE"
+    echo "Тип сжатия: без сжатия (обычный tar)" | tee -a "$LOG_FILE"
 fi
 
-echo "Финальный файл для восстановления: $BACKUP_FILE" | tee -a "$LOG_FILE"
+ARCHIVE_CONTENTS=$(tar $TAR_OPTS "$BACKUP_DIR/$BACKUP_FILE" 2>/dev/null | head -30 || true)
+echo "Содержимое архива (первые 30 строк):" | tee -a "$LOG_FILE"
+echo "$ARCHIVE_CONTENTS" | tee -a "$LOG_FILE"
+
+# Определяем тип бэкапа: полный бэкап пользователя или бэкап домена
+if tar $TAR_OPTS "$BACKUP_DIR/$BACKUP_FILE" 2>/dev/null | grep -q "^./pam/\|^pam/"; then
+    echo "Обнаружен ПОЛНЫЙ бэкап пользователя (найдена директория ./pam/)" | tee -a "$LOG_FILE"
+    log_progress "Извлекаю домен $DOMAIN из полного бэкапа пользователя..."
+
+    # Создаем временную директорию для извлечения
+    EXTRACT_DIR="$LOG_DIR/extracted"
+    mkdir -p "$EXTRACT_DIR"
+
+    # Определяем опции распаковки
+    TAR_EXTRACT_OPTS="-xf"
+    if echo "$ARCHIVE_INFO" | grep -qi "gzip"; then
+        TAR_EXTRACT_OPTS="-xzf"
+    elif echo "$ARCHIVE_INFO" | grep -qi "bzip2"; then
+        TAR_EXTRACT_OPTS="-xjf"
+    elif echo "$ARCHIVE_INFO" | grep -qi "xz"; then
+        TAR_EXTRACT_OPTS="-xJf"
+    elif echo "$ARCHIVE_INFO" | grep -qi "zstandard"; then
+        TAR_EXTRACT_OPTS="--zstd -xf"
+    fi
+
+    # Извлекаем весь архив
+    echo "Распаковываю полный бэкап..." | tee -a "$LOG_FILE"
+    if ! tar $TAR_EXTRACT_OPTS "$BACKUP_DIR/$BACKUP_FILE" -C "$EXTRACT_DIR" 2>&1 | tee -a "$LOG_FILE"; then
+        RESTORE_STATUS="error"
+        RESTORE_MESSAGE="Ошибка: не удалось распаковать архив пользователя"
+        send_webhook
+        exit 1
+    fi
+
+    # Ищем файлы для нужного домена
+    echo "Ищу файлы для домена $DOMAIN..." | tee -a "$LOG_FILE"
+
+    # Создаем новый архив только с файлами нужного домена
+    DOMAIN_BACKUP_FILE="${USERNAME}.${DOMAIN}.$(date '+%Y-%m-%d_%H-%M-%S').tar"
+
+    cd "$EXTRACT_DIR" || exit 1
+
+    # Создаем tar архив с файлами домена
+    # Ищем web/$DOMAIN/, db/ для этого домена
+    echo "Создаю архив для домена $DOMAIN..." | tee -a "$LOG_FILE"
+
+    # Ищем файлы для данного домена
+    DOMAIN_FILES=$(find . -path "./web/$DOMAIN*" -o -path "./db/*$DOMAIN*" -o -path "./dns/$DOMAIN*" 2>/dev/null)
+
+    if [ -z "$DOMAIN_FILES" ]; then
+        RESTORE_STATUS="error"
+        RESTORE_MESSAGE="Ошибка: домен $DOMAIN не найден в бэкапе пользователя"
+        echo "$RESTORE_MESSAGE" | tee -a "$LOG_FILE"
+        echo "Доступные домены в бэкапе:" | tee -a "$LOG_FILE"
+        find . -maxdepth 2 -type d -path "./web/*" | sed 's|./web/||' | tee -a "$LOG_FILE"
+        send_webhook
+        exit 1
+    fi
+
+    echo "Найденные файлы для домена:" | tee -a "$LOG_FILE"
+    echo "$DOMAIN_FILES" | head -20 | tee -a "$LOG_FILE"
+
+    # Создаем tar архив, сохраняя структуру директорий
+    echo "$DOMAIN_FILES" | tar -cf "$BACKUP_DIR/$DOMAIN_BACKUP_FILE" -T - 2>&1 | tee -a "$LOG_FILE"
+
+    # Проверяем, что новый архив создан
+    if [ ! -f "$BACKUP_DIR/$DOMAIN_BACKUP_FILE" ] || [ ! -s "$BACKUP_DIR/$DOMAIN_BACKUP_FILE" ]; then
+        RESTORE_STATUS="error"
+        RESTORE_MESSAGE="Ошибка: не удалось создать архив для домена $DOMAIN"
+        echo "$RESTORE_MESSAGE" | tee -a "$LOG_FILE"
+        send_webhook
+        exit 1
+    fi
+
+    echo "Проверяю содержимое созданного архива..." | tee -a "$LOG_FILE"
+    tar -tf "$BACKUP_DIR/$DOMAIN_BACKUP_FILE" | head -20 | tee -a "$LOG_FILE"
+
+    # Удаляем оригинальный архив и используем новый
+    rm -f "$BACKUP_DIR/$BACKUP_FILE"
+    BACKUP_FILE="$DOMAIN_BACKUP_FILE"
+
+    # Очищаем временную директорию
+    rm -rf "$EXTRACT_DIR"
+
+    echo "Создан архив домена: $BACKUP_FILE" | tee -a "$LOG_FILE"
+    cd "$BACKUP_DIR" || exit 1
+else
+    echo "Обнаружен бэкап домена/сайта" | tee -a "$LOG_FILE"
+fi
+
+echo "Архив готов к восстановлению: $BACKUP_FILE" | tee -a "$LOG_FILE"
 
 # === Восстанавливаем пользователя и домен через v-restore-user ===
-log_progress "Запускаю v-restore-user для восстановления пользователя и домена..."
+log_progress "Запускаю v-restore-user для восстановления домена $DOMAIN..."
 
 # Запускаем v-restore-user
-# Формат: v-restore-user USER BACKUP.tar 'DOMAIN' 'no' 'no' 'no' 'no' 'no' yes
-# DB будет восстановлена, но мы создадим новую БД позже и импортируем данные
-RESTORE_OUTPUT=$(v-restore-user "$USER" "$RESTORE_DIR/$BACKUP_FILE" "$DOMAIN" 'no' 'no' 'no' 'no' 'no' yes 2>&1) || RESTORE_FAILED=$?
+# v-restore-user ожидает, что архив находится в /backup/ и принимает только имя файла
+# Формат: v-restore-user USER BACKUP DOMAIN [WEB] [DNS] [MAIL] [DB] [CRON] [UDIR]
+echo "Восстанавливаю бэкап домена $DOMAIN..." | tee -a "$LOG_FILE"
+RESTORE_OUTPUT=$(v-restore-user "$USER" "$BACKUP_FILE" "$DOMAIN" 'no' 'no' 'no' 'no' 'no' 'yes' 2>&1) || RESTORE_FAILED=$?
 
 if [ "${RESTORE_FAILED:-0}" -ne 0 ]; then
     echo "v-restore-user вернул код ошибки: $RESTORE_FAILED" | tee -a "$LOG_FILE"
@@ -442,13 +521,13 @@ if [ "${RESTORE_FAILED:-0}" -ne 0 ]; then
 
     # Удаляем все временные файлы при ошибке
     ORIGINAL_BACKUP=$(basename "$FULL_S3_PATH")
-    if [ -f "$RESTORE_DIR/$ORIGINAL_BACKUP" ]; then
-        rm -f "$RESTORE_DIR/$ORIGINAL_BACKUP"
+    if [ -f "$BACKUP_DIR/$ORIGINAL_BACKUP" ]; then
+        rm -f "$BACKUP_DIR/$ORIGINAL_BACKUP"
         echo "Оригинальный архив удалён: $ORIGINAL_BACKUP" | tee -a "$LOG_FILE"
     fi
 
-    if [ -f "$RESTORE_DIR/$BACKUP_FILE" ] && [ "$BACKUP_FILE" != "$ORIGINAL_BACKUP" ]; then
-        rm -f "$RESTORE_DIR/$BACKUP_FILE"
+    if [ -f "$BACKUP_DIR/$BACKUP_FILE" ] && [ "$BACKUP_FILE" != "$ORIGINAL_BACKUP" ]; then
+        rm -f "$BACKUP_DIR/$BACKUP_FILE"
         echo "Распакованный архив удалён: $BACKUP_FILE" | tee -a "$LOG_FILE"
     fi
 
@@ -587,7 +666,7 @@ else
 
     # SQL дамп всегда в корне архива, ищем его рекурсивно в RESTORE_DIR и WP_PATH
     log_progress "Поиск SQL дампа для импорта..."
-    SQL_DUMP=$(find "$RESTORE_DIR" -type f \( -name "*.sql" -o -name "*.sql.gz" \) 2>/dev/null | head -n 1 || true)
+    SQL_DUMP=$(find "$BACKUP_DIR" -type f \( -name "*.sql" -o -name "*.sql.gz" \) 2>/dev/null | head -n 1 || true)
 
     # Если не найден в RESTORE_DIR, ищем в WP_PATH (где распакован архив)
     if [ -z "$SQL_DUMP" ] || [ ! -f "$SQL_DUMP" ]; then
@@ -632,14 +711,14 @@ log_progress "Очистка временных файлов..."
 
 # Удаляем оригинальный скачанный файл
 ORIGINAL_BACKUP=$(basename "$FULL_S3_PATH")
-if [ -f "$RESTORE_DIR/$ORIGINAL_BACKUP" ]; then
-    rm -f "$RESTORE_DIR/$ORIGINAL_BACKUP"
+if [ -f "$BACKUP_DIR/$ORIGINAL_BACKUP" ]; then
+    rm -f "$BACKUP_DIR/$ORIGINAL_BACKUP"
     echo "Оригинальный архив удалён: $ORIGINAL_BACKUP" | tee -a "$LOG_FILE"
 fi
 
 # Удаляем распакованный tar (если был создан)
-if [ -f "$RESTORE_DIR/$BACKUP_FILE" ] && [ "$BACKUP_FILE" != "$ORIGINAL_BACKUP" ]; then
-    rm -f "$RESTORE_DIR/$BACKUP_FILE"
+if [ -f "$BACKUP_DIR/$BACKUP_FILE" ] && [ "$BACKUP_FILE" != "$ORIGINAL_BACKUP" ]; then
+    rm -f "$BACKUP_DIR/$BACKUP_FILE"
     echo "Распакованный архив удалён: $BACKUP_FILE" | tee -a "$LOG_FILE"
 fi
 
