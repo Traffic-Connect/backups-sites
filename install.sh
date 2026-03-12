@@ -1,6 +1,6 @@
 #!/bin/bash
 # Скрипт установки зависимостей и команд для бэкапа WordPress и восстановления пользователей
-# VERSION: 2.1
+# VERSION: 2.2
 
 set -e
 
@@ -111,6 +111,16 @@ if [ ! -f "remove-domain.sh" ]; then
     exit 1
 fi
 
+if [ ! -f "$CURRENT_DIR/wp-site-restore-s3.sh" ]; then
+    echo "ОШИБКА: Файл wp-site-restore-s3.sh не найден в текущей директории"
+    exit 1
+fi
+
+if [ ! -f "$CURRENT_DIR/v-site-restore-s3" ]; then
+    echo "ОШИБКА: Файл v-site-restore-s3 не найден в текущей директории"
+    exit 1
+fi
+
 # Копирование команды Hestia
 if [ -f "/usr/local/hestia/bin/v-wp-backup-s3" ]; then
     echo "  v-wp-backup-s3 уже существует, перезаписываем..."
@@ -174,6 +184,22 @@ fi
 cp "$CURRENT_DIR/restore-user-s3.sh" /usr/local/bin/
 chmod +x /usr/local/bin/restore-user-s3.sh
 echo "  restore-user-s3.sh установлен в /usr/local/bin/"
+
+# Копирование команды Hestia
+if [ -f "/usr/local/hestia/bin/v-site-restore-s3" ]; then
+    echo "  v-site-restore-s3 уже существует, перезаписываем..."
+fi
+cp "$CURRENT_DIR/v-site-restore-s3" /usr/local/hestia/bin/
+chmod +x /usr/local/hestia/bin/v-site-restore-s3
+echo "  v-site-restore-s3 установлен в /usr/local/hestia/bin/"
+
+# Копирование основного скрипта
+if [ -f "/usr/local/bin/wp-site-restore-s3.sh" ]; then
+    echo "  wp-site-restore-s3.sh уже существует, перезаписываем..."
+fi
+cp "$CURRENT_DIR/wp-site-restore-s3.sh" /usr/local/bin/
+chmod +x /usr/local/bin/wp-site-restore-s3.sh
+echo "  wp-site-restore-s3.sh установлен в /usr/local/bin/"
 
 # Создание директории для бэкапов
 mkdir -p /backup
@@ -335,9 +361,11 @@ echo "  - /usr/local/hestia/bin/v-wp-backup-s3"
 echo "  - /usr/local/hestia/bin/v-wp-restore-s3"
 echo "  - /usr/local/hestia/bin/v-restore-user-s3"
 echo "  - /usr/local/hestia/bin/v-check-file-exists"
+echo "  - /usr/local/hestia/bin/v-site-restore-s3"
 echo "  - /usr/local/bin/wp-backup-s3.sh"
 echo "  - /usr/local/bin/wp-restore-s3.sh"
 echo "  - /usr/local/bin/restore-user-s3.sh"
+echo "  - /usr/local/bin/wp-site-restore-s3.sh"
 echo "  - /usr/local/bin/remove-domain.sh"
 echo "  - /usr/local/bin/wp-backup-auto-update.sh"
 echo ""
