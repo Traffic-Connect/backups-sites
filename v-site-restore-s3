@@ -49,29 +49,23 @@ echo "--------------------------------------------------------" >> "$LOG_FILE"
 #                       Action                             #
 #----------------------------------------------------------#
 
-/usr/local/bin/wp-site-restore-s3.sh "$domain" "$backup_url" "$backup_id" "$site_id" "$server_id" "$username" "$environment" \
-    >>"$LOG_FILE" 2>&1
-RESULT=$?
+# Запускаем скрипт в фоновом режиме, чтобы избежать таймаутов
+nohup /usr/local/bin/wp-site-restore-s3.sh "$domain" "$backup_url" "$backup_id" "$site_id" "$server_id" "$username" "$environment" \
+    >>"$LOG_FILE" 2>&1 &
 
-echo "[$(date '+%F %T')] Exit code: $RESULT" >> "$LOG_FILE"
+RESTORE_PID=$!
+
+echo "[$(date '+%F %T')] Restore started in background with PID: $RESTORE_PID" >> "$LOG_FILE"
 
 #----------------------------------------------------------#
 #                       Hestia                             #
 #----------------------------------------------------------#
 
-if [ $RESULT -eq 0 ]; then
-    log_event "$OK" "$ARGUMENTS"
-    RESTORE_STATUS="done"
-    RESTORE_MESSAGE="Backup for $domain from $backup_url restored successfully"
-    echo "[$(date '+%F %T')] SUCCESS for $domain" >> "$LOG_FILE"
-else
-    log_event "$E_NOTEXIST" "$ARGUMENTS"
-    RESTORE_STATUS="error"
-    RESTORE_MESSAGE="Backup for $domain from $backup_url failed (exit code $RESULT)"
-    echo "[$(date '+%F %T')] ERROR for $domain (exit code $RESULT)" >> "$LOG_FILE"
-    echo "----- Last 20 log lines from restore -----" >> "$LOG_FILE"
-    tail -n 20 "$LOG_FILE" >> "$LOG_FILE"
-fi
+# Логируем старт процесса
+log_event "$OK" "$ARGUMENTS"
+RESTORE_STATUS="started"
+RESTORE_MESSAGE="Restore process for $domain started in background (PID: $RESTORE_PID). Check logs at $LOG_DIR/restore.log"
+echo "[$(date '+%F %T')] Process started for $domain (PID: $RESTORE_PID)" >> "$LOG_FILE"
 
 echo "--------------------------------------------------------" >> "$LOG_FILE"
 
@@ -88,7 +82,9 @@ JSON=$(cat <<EOF
   "server_id": "$server_id",
   "username": "$username",
   "restore_status": "$RESTORE_STATUS",
-  "restore_message": "$RESTORE_MESSAGE"
+  "restore_message": "$RESTORE_MESSAGE",
+  "pid": $RESTORE_PID,
+  "log_file": "$LOG_DIR/restore.log"
 }
 EOF
 )

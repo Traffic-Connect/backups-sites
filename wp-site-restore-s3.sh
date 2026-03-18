@@ -5,7 +5,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="v1"
+VERSION="v2"
 
 export PATH=$PATH:/usr/local/hestia/bin
 
@@ -56,7 +56,8 @@ send_webhook() {
     local WEBHOOK_URL="https://${ENVIRONMENT}/api/b2-webhooks/site-restore-backblaze"
     echo "Отправляю webhook со статусом '$RESTORE_STATUS'..." | tee -a "$LOG_FILE"
 
-    curl -s --max-time 15 -X POST "$WEBHOOK_URL" \
+    # Используем timeout для предотвращения зависания
+    timeout 10 curl -s --max-time 8 --connect-timeout 5 -X POST "$WEBHOOK_URL" \
         -H "Content-Type: application/json" \
         -d @<(cat <<JSON
 {
@@ -71,7 +72,13 @@ send_webhook() {
     "service": "s3"
 }
 JSON
-) >> "$LOG_FILE" 2>&1 || true
+) >> "$LOG_FILE" 2>&1 || {
+        echo "Webhook timeout or failed (non-critical)" >> "$LOG_FILE"
+        return 0
+    }
+
+    echo "Webhook отправлен" | tee -a "$LOG_FILE"
+    return 0
 }
 
 # === Функция логирования с отправкой webhook о прогрессе ===
@@ -79,10 +86,13 @@ log_progress() {
     local message="$1"
     echo "$message" | tee -a "$LOG_FILE"
 
-    # Отправляем webhook о прогрессе
+    # Отправляем webhook о прогрессе (с защитой от ошибок)
     RESTORE_STATUS="progress"
     RESTORE_MESSAGE="$message"
-    send_webhook
+    send_webhook || {
+        echo "WARNING: Webhook failed for message: $message" | tee -a "$LOG_FILE"
+        return 0
+    }
 }
 
 # Используем переданного пользователя
@@ -125,25 +135,46 @@ cd "$BACKUP_DIR" || {
 
 # === Определяем способ скачивания ===
 if [[ "$FULL_S3_PATH" == s3://* ]]; then
-    log_progress "Скачивание архива из S3 (через AWS CLI)..."
     # Извлекаем имя файла из S3 пути
     BACKUP_FILE=$(basename "$FULL_S3_PATH")
-    echo "Скачиваю файл: $BACKUP_FILE" | tee -a "$LOG_FILE"
-
-    # Получаем размер файла в S3
-    TOTAL_SIZE=$(aws --endpoint-url "$AWS_ENDPOINT" s3api head-object --bucket "$(echo $FULL_S3_PATH | cut -d'/' -f3)" --key "$(echo $FULL_S3_PATH | cut -d'/' -f4-)" --query ContentLength --output text 2>/dev/null || echo "0")
-    echo "Размер файла в S3: $TOTAL_SIZE байт" | tee -a "$LOG_FILE"
-
-    # Запускаем скачивание в фоне
     DOWNLOAD_FILE="$BACKUP_DIR/$BACKUP_FILE"
-    echo "Скачиваю в: $DOWNLOAD_FILE" | tee -a "$LOG_FILE"
+
+    # Проверяем, существует ли уже скачанный файл
+    if [ -f "$DOWNLOAD_FILE" ]; then
+        log_progress "Архив уже существует локально, проверяю целостность..."
+
+        # Получаем размер файла в S3 для сравнения
+        TOTAL_SIZE=$(aws --endpoint-url "$AWS_ENDPOINT" s3api head-object --bucket "$(echo $FULL_S3_PATH | cut -d'/' -f3)" --key "$(echo $FULL_S3_PATH | cut -d'/' -f4-)" --query ContentLength --output text 2>/dev/null || echo "0")
+        LOCAL_SIZE=$(stat -c%s "$DOWNLOAD_FILE" 2>/dev/null || stat -f%z "$DOWNLOAD_FILE" 2>/dev/null || echo "0")
+
+        echo "Размер файла в S3: $TOTAL_SIZE байт" | tee -a "$LOG_FILE"
+        echo "Размер локального файла: $LOCAL_SIZE байт" | tee -a "$LOG_FILE"
+
+        if [ "$LOCAL_SIZE" -eq "$TOTAL_SIZE" ] && [ "$TOTAL_SIZE" -gt 0 ]; then
+            log_progress "Локальный архив совпадает с размером в S3, пропускаю скачивание"
+            echo "Использую существующий архив: $DOWNLOAD_FILE" | tee -a "$LOG_FILE"
+        else
+            log_progress "Локальный архив повреждён или неполный, удаляю и скачиваю заново..."
+            rm -f "$DOWNLOAD_FILE"
+            echo "Повреждённый архив удалён" | tee -a "$LOG_FILE"
+        fi
+    fi
+
+    # Если файл не существует или был удалён, скачиваем
+    if [ ! -f "$DOWNLOAD_FILE" ]; then
+        log_progress "Скачивание архива из S3 (через AWS CLI)..."
+        echo "Скачиваю файл: $BACKUP_FILE" | tee -a "$LOG_FILE"
+
+        # Получаем размер файла в S3
+        TOTAL_SIZE=$(aws --endpoint-url "$AWS_ENDPOINT" s3api head-object --bucket "$(echo $FULL_S3_PATH | cut -d'/' -f3)" --key "$(echo $FULL_S3_PATH | cut -d'/' -f4-)" --query ContentLength --output text 2>/dev/null || echo "0")
+        echo "Размер файла в S3: $TOTAL_SIZE байт" | tee -a "$LOG_FILE"
+
+        echo "Скачиваю в: $DOWNLOAD_FILE" | tee -a "$LOG_FILE"
 
     # Создаем временный файл для вывода AWS CLI
     AWS_LOG=$(mktemp)
 
     # Конфигурируем AWS CLI для предотвращения зависания и ошибок retry
-    # Проблема: слишком короткие таймауты вызывают "Max Retries Exceeded"
-    # Решение: увеличиваем таймауты, но уменьшаем параллелизм
     export AWS_MAX_ATTEMPTS=5
     export AWS_RETRY_MODE=standard
 
@@ -165,7 +196,6 @@ EOF
     export AWS_CONFIG_FILE
 
     # Убираем короткие таймауты, которые вызывают Max Retries Exceeded
-    # AWS CLI сам управляет таймаутами для больших файлов
     aws --endpoint-url "$AWS_ENDPOINT" \
         s3 cp "$FULL_S3_PATH" "$DOWNLOAD_FILE" \
         --no-progress > "$AWS_LOG" 2>&1 &
@@ -182,7 +212,6 @@ EOF
 
     while kill -0 $AWS_PID 2>/dev/null; do
         # AWS CLI создает временный файл с суффиксом во время скачивания
-        # Ищем либо финальный файл, либо временный файл с маской
         TEMP_FILE=$(ls -1 "${DOWNLOAD_FILE}"* 2>/dev/null | head -n 1 || echo "")
 
         if [ -n "$TEMP_FILE" ] && [ -f "$TEMP_FILE" ]; then
@@ -339,13 +368,14 @@ EOF
         fi
     fi
 
-    if [ $AWS_EXIT_CODE -ne 0 ]; then
-        RESTORE_STATUS="error"
-        RESTORE_MESSAGE="Ошибка: архив не найден в S3 ($FULL_S3_PATH). Код выхода: $AWS_EXIT_CODE"
-        echo "$RESTORE_MESSAGE" | tee -a "$LOG_FILE"
-        send_webhook
-        exit 1
-    fi
+        if [ $AWS_EXIT_CODE -ne 0 ]; then
+            RESTORE_STATUS="error"
+            RESTORE_MESSAGE="Ошибка: архив не найден в S3 ($FULL_S3_PATH). Код выхода: $AWS_EXIT_CODE"
+            echo "$RESTORE_MESSAGE" | tee -a "$LOG_FILE"
+            send_webhook
+            exit 1
+        fi
+    fi  # Конец блока: if [ ! -f "$DOWNLOAD_FILE" ]
 else
     log_progress "Скачивание архива по HTTPS (прямая загрузка)..."
     # Извлекаем имя файла из URL (удаляем query параметры после ?)
@@ -458,26 +488,78 @@ if [ "${RESTORE_FAILED:-0}" -ne 0 ]; then
     echo "Вывод команды: $RESTORE_OUTPUT" | tee -a "$LOG_FILE"
     RESTORE_STATUS="error"
     RESTORE_MESSAGE="Ошибка при восстановлении через v-restore-user. Детали: $RESTORE_OUTPUT"
-
-    # Удаляем все временные файлы при ошибке
-    log_progress "Очистка: удаляю скачанный архив из-за ошибки..."
-    ORIGINAL_BACKUP=$(basename "$FULL_S3_PATH")
-    if [ -f "$BACKUP_DIR/$ORIGINAL_BACKUP" ]; then
-        rm -f "$BACKUP_DIR/$ORIGINAL_BACKUP"
-        echo "Оригинальный архив удалён: $ORIGINAL_BACKUP" | tee -a "$LOG_FILE"
-    fi
-
-    if [ -f "$BACKUP_DIR/$BACKUP_FILE" ] && [ "$BACKUP_FILE" != "$ORIGINAL_BACKUP" ]; then
-        rm -f "$BACKUP_DIR/$BACKUP_FILE"
-        echo "Переименованный архив удалён: $BACKUP_FILE" | tee -a "$LOG_FILE"
-    fi
-
     send_webhook
     exit 1
 fi
 
 log_progress "Пользователь и домен успешно восстановлены через v-restore-user"
 echo "Вывод v-restore-user: $RESTORE_OUTPUT" | tee -a "$LOG_FILE"
+
+# === Извлекаем папку db/ из архива для SQL дампов ===
+log_progress "Извлекаю SQL дампы из архива..."
+
+echo "Архив: $BACKUP_DIR/$BACKUP_FILE" | tee -a "$LOG_FILE"
+echo "Проверяю наличие папки db/ в архиве..." | tee -a "$LOG_FILE"
+
+# Определяем опции tar в зависимости от типа архива
+TAR_EXTRACT_OPTS="-xf"
+BACKUP_FILE_PATH="$BACKUP_DIR/$BACKUP_FILE"
+
+if [[ "$BACKUP_FILE" == *.tar.gz ]]; then
+    TAR_EXTRACT_OPTS="-xzf"
+elif [[ "$BACKUP_FILE" == *.tar.bz2 ]]; then
+    TAR_EXTRACT_OPTS="-xjf"
+elif [[ "$BACKUP_FILE" == *.tar.xz ]]; then
+    TAR_EXTRACT_OPTS="-xJf"
+elif [[ "$BACKUP_FILE" == *.tar.zst ]]; then
+    TAR_EXTRACT_OPTS="--zstd -xf"
+fi
+
+# Смотрим структуру архива
+echo "Содержимое архива (первые 50 строк):" | tee -a "$LOG_FILE"
+tar -tf "$BACKUP_FILE_PATH" 2>/dev/null | head -50 | tee -a "$LOG_FILE" || true
+
+# Проверяем, есть ли папка db/ в архиве
+echo "Поиск папки db/ в архиве..." | tee -a "$LOG_FILE"
+DB_ENTRIES=$(tar -tf "$BACKUP_FILE_PATH" 2>/dev/null | grep "db/" | head -20 || true)
+echo "Найденные записи db/:" | tee -a "$LOG_FILE"
+echo "$DB_ENTRIES" | tee -a "$LOG_FILE"
+
+DB_IN_ARCHIVE=$(echo "$DB_ENTRIES" | grep -c "db/" || echo "0")
+echo "Найдено записей db/ в архиве: $DB_IN_ARCHIVE" | tee -a "$LOG_FILE"
+
+if [ "$DB_IN_ARCHIVE" -gt 0 ]; then
+    log_progress "Папка db/ найдена в архиве, извлекаю во временную директорию..."
+
+    # Создаём временную директорию для извлечения
+    TEMP_EXTRACT_DIR="$BACKUP_DIR/temp_extract_$$"
+    mkdir -p "$TEMP_EXTRACT_DIR"
+    echo "Временная директория: $TEMP_EXTRACT_DIR" | tee -a "$LOG_FILE"
+
+    # Извлекаем только папку db/
+    cd "$TEMP_EXTRACT_DIR"
+    echo "Извлекаю папку db/ из архива..." | tee -a "$LOG_FILE"
+
+    # Пробуем извлечь папку db/ - используем паттерн "./db" так как в архиве структура ./db/
+    echo "Выполняю: tar $TAR_EXTRACT_OPTS $BACKUP_FILE_PATH ./db" | tee -a "$LOG_FILE"
+    if tar $TAR_EXTRACT_OPTS "$BACKUP_FILE_PATH" ./db 2>&1 | tee -a "$LOG_FILE"; then
+        log_progress "SQL дампы извлечены из архива"
+
+        # Показываем содержимое
+        echo "Содержимое извлечённой папки:" | tee -a "$LOG_FILE"
+        ls -laR "$TEMP_EXTRACT_DIR" 2>/dev/null | head -100 | tee -a "$LOG_FILE" || true
+
+        echo "SQL файлы:" | tee -a "$LOG_FILE"
+        find "$TEMP_EXTRACT_DIR" -type f -name "*.sql*" 2>/dev/null | tee -a "$LOG_FILE" || true
+    else
+        echo "Ошибка при извлечении папки db/ из архива" | tee -a "$LOG_FILE"
+        echo "Возможно, папка db/ отсутствует в этом архиве" | tee -a "$LOG_FILE"
+    fi
+
+    cd "$BACKUP_DIR"
+else
+    echo "Папка db/ не найдена в архиве, возможно это бэкап только домена" | tee -a "$LOG_FILE"
+fi
 
 # === Распаковываем domain_data.tar.zst если он есть ===
 DOMAIN_DIR="/home/$USER/web/$DOMAIN"
@@ -583,8 +665,19 @@ if [ ! -f "$CONFIG" ]; then
         echo "ВНИМАНИЕ: wp-config.php не найден - возможно, это НЕ WordPress сайт (статический HTML)" | tee -a "$LOG_FILE"
         log_progress "Пропускаю настройку WordPress - сайт восстановлен как есть"
 
-        # Удаляем архив перед завершением
-        log_progress "Очистка временных файлов..."
+        # Пропускаем секцию WordPress и переходим к завершению
+        RESTORE_STATUS="done"
+        RESTORE_MESSAGE="Восстановление домена $DOMAIN выполнено успешно (без настройки WordPress - статический сайт)"
+
+        # Удаляем временные файлы только при успешном завершении
+        log_progress "Удаляю временные файлы после успешного восстановления..."
+
+        # Удаляем временную директорию
+        if [ -n "$TEMP_EXTRACT_DIR" ] && [ -d "$TEMP_EXTRACT_DIR" ]; then
+            rm -rf "$TEMP_EXTRACT_DIR"
+            echo "Временная директория удалена: $TEMP_EXTRACT_DIR" | tee -a "$LOG_FILE"
+        fi
+
         ORIGINAL_BACKUP=$(basename "$FULL_S3_PATH")
         if [ -f "$BACKUP_DIR/$ORIGINAL_BACKUP" ]; then
             rm -f "$BACKUP_DIR/$ORIGINAL_BACKUP"
@@ -595,9 +688,6 @@ if [ ! -f "$CONFIG" ]; then
             echo "Переименованный архив удалён: $BACKUP_FILE" | tee -a "$LOG_FILE"
         fi
 
-        # Пропускаем секцию WordPress и переходим к завершению
-        RESTORE_STATUS="done"
-        RESTORE_MESSAGE="Восстановление домена $DOMAIN выполнено успешно (без настройки WordPress - статический сайт)"
         send_webhook
         exit 0
     fi
@@ -607,8 +697,18 @@ if [ ! -f "$CONFIG" ]; then
     echo "ВНИМАНИЕ: wp-config.php не найден - возможно, это НЕ WordPress сайт" | tee -a "$LOG_FILE"
     log_progress "Пропускаю настройку WordPress - сайт восстановлен как есть"
 
-    # Очистка временных файлов перед завершением
-    log_progress "Очистка временных файлов..."
+    RESTORE_STATUS="done"
+    RESTORE_MESSAGE="Восстановление домена $DOMAIN выполнено успешно (без настройки WordPress - статический сайт)"
+
+    # Удаляем временные файлы только при успешном завершении
+    log_progress "Удаляю временные файлы после успешного восстановления..."
+
+    # Удаляем временную директорию
+    if [ -n "$TEMP_EXTRACT_DIR" ] && [ -d "$TEMP_EXTRACT_DIR" ]; then
+        rm -rf "$TEMP_EXTRACT_DIR"
+        echo "Временная директория удалена: $TEMP_EXTRACT_DIR" | tee -a "$LOG_FILE"
+    fi
+
     ORIGINAL_BACKUP=$(basename "$FULL_S3_PATH")
     if [ -f "$BACKUP_DIR/$ORIGINAL_BACKUP" ]; then
         rm -f "$BACKUP_DIR/$ORIGINAL_BACKUP"
@@ -619,8 +719,6 @@ if [ ! -f "$CONFIG" ]; then
         echo "Переименованный архив удалён: $BACKUP_FILE" | tee -a "$LOG_FILE"
     fi
 
-    RESTORE_STATUS="done"
-    RESTORE_MESSAGE="Восстановление домена $DOMAIN выполнено успешно (без настройки WordPress - статический сайт)"
     send_webhook
     exit 0
 fi
@@ -642,101 +740,481 @@ echo "Имя БД: $DB_NAME" | tee -a "$LOG_FILE"
 echo "Пользователь БД: $DB_USER" | tee -a "$LOG_FILE"
 
 # Проверяем, существует ли БД в HestiaCP
-# Извлекаем короткое имя БД без префикса пользователя
+# Сначала пробуем точное совпадение с USER_
 if [[ "$DB_NAME" == ${USER}_* ]]; then
     SHORT_DB_NAME="${DB_NAME#${USER}_}"
+    echo "Префикс '$USER' найден и удален. Короткое имя: $SHORT_DB_NAME" | tee -a "$LOG_FILE"
+# Пробуем найти префикс USER без подчеркивания в конце
+elif [[ "$DB_NAME" == ${USER%_}_* ]]; then
+    SHORT_DB_NAME="${DB_NAME#${USER%_}_}"
+    echo "Префикс '${USER%_}' найден и удален. Короткое имя: $SHORT_DB_NAME" | tee -a "$LOG_FILE"
+# Если DB_NAME начинается с букв из USER, пробуем разные варианты
 else
-    SHORT_DB_NAME="$DB_NAME"
+    # Для случаев типа: USER=schema_44, DB_NAME=schema44_winline_by
+    # Убираем подчеркивания из USER и ищем совпадение
+    USER_NO_UNDERSCORE="${USER//_/}"
+    if [[ "$DB_NAME" == ${USER_NO_UNDERSCORE}_* ]]; then
+        SHORT_DB_NAME="${DB_NAME#${USER_NO_UNDERSCORE}_}"
+        echo "Префикс '$USER_NO_UNDERSCORE' (без подчеркиваний) найден и удален. Короткое имя: $SHORT_DB_NAME" | tee -a "$LOG_FILE"
+    else
+        # Если ничего не подошло, используем полное имя БД как есть
+        SHORT_DB_NAME="$DB_NAME"
+        echo "Префикс пользователя не найден, используется полное имя: $SHORT_DB_NAME" | tee -a "$LOG_FILE"
+    fi
 fi
 
-# Проверяем существование БД
-if v-list-database "$USER" "$SHORT_DB_NAME" >/dev/null 2>&1; then
-    log_progress "База данных $DB_NAME уже существует в HestiaCP"
-else
-    log_progress "База данных $DB_NAME не найдена в HestiaCP. Создаю..."
+# Сначала проверяем существование БД напрямую в MySQL/MariaDB
+FULL_DB_NAME="${USER}_${SHORT_DB_NAME}"
+log_progress "Проверяю существование БД в MySQL: $FULL_DB_NAME"
 
-    # Извлекаем короткое имя пользователя БД без префикса
-    if [[ "$DB_USER" == ${USER}_* ]]; then
-        SHORT_DB_USER="${DB_USER#${USER}_}"
+echo "Запрашиваю список всех баз данных пользователя..." | tee -a "$LOG_FILE"
+mariadb -e "SHOW DATABASES LIKE '${USER}_%';" 2>&1 | tee -a "$LOG_FILE"
+
+# Список всех возможных вариантов имени БД для удаления
+USER_NO_UNDERSCORE="${USER//_/}"
+POSSIBLE_DB_NAMES=(
+    "${USER}_${SHORT_DB_NAME}"
+    "${USER}_${USER_NO_UNDERSCORE}_${SHORT_DB_NAME}"
+    "${USER}_${DB_NAME}"
+)
+
+echo "Проверяю и удаляю все варианты имён БД..." | tee -a "$LOG_FILE"
+DELETED_COUNT=0
+
+for CHECK_DB_NAME in "${POSSIBLE_DB_NAMES[@]}"; do
+    # Удаляем дубликаты из массива
+    if [[ " ${CHECKED_DBS[@]} " =~ " ${CHECK_DB_NAME} " ]]; then
+        continue
+    fi
+    CHECKED_DBS+=("$CHECK_DB_NAME")
+
+    echo "Проверяю: $CHECK_DB_NAME" | tee -a "$LOG_FILE"
+    DB_EXISTS=$(mariadb -e "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='$CHECK_DB_NAME';" 2>/dev/null | grep -c "$CHECK_DB_NAME" || echo "0")
+
+    if [ "$DB_EXISTS" -gt 0 ]; then
+        log_progress "Найдена база данных: $CHECK_DB_NAME. Удаляю..."
+
+        echo "Выполняю: DROP DATABASE IF EXISTS \`$CHECK_DB_NAME\`" | tee -a "$LOG_FILE"
+        if mariadb -e "DROP DATABASE IF EXISTS \`$CHECK_DB_NAME\`;" 2>&1 | tee -a "$LOG_FILE"; then
+            echo "База данных $CHECK_DB_NAME удалена из MySQL" | tee -a "$LOG_FILE"
+            DELETED_COUNT=$((DELETED_COUNT + 1))
+        else
+            RESTORE_STATUS="error"
+            RESTORE_MESSAGE="Ошибка: не удалось удалить существующую базу данных $CHECK_DB_NAME из MySQL"
+            send_webhook
+            exit 1
+        fi
+    fi
+done
+
+echo "DELETED_COUNT=$DELETED_COUNT" | tee -a "$LOG_FILE"
+
+if [ "$DELETED_COUNT" -gt 0 ]; then
+    echo "Удалено баз данных: $DELETED_COUNT" | tee -a "$LOG_FILE"
+
+    # Также удаляем всех возможных пользователей БД
+    FULL_DB_USER="${USER}_${SHORT_DB_USER}"
+    echo "FULL_DB_USER=$FULL_DB_USER" | tee -a "$LOG_FILE"
+    echo "Начинаю удаление пользователя БД: $FULL_DB_USER" | tee -a "$LOG_FILE"
+
+    # Используем timeout для предотвращения зависания
+    timeout 10 mariadb -e "DROP USER IF EXISTS '${FULL_DB_USER}'@'localhost';" 2>&1 | tee -a "$LOG_FILE" || echo "DROP USER завершён (timeout или ошибка)" | tee -a "$LOG_FILE"
+    echo "Команда DROP USER завершена" | tee -a "$LOG_FILE"
+
+    echo "Начинаю FLUSH PRIVILEGES" | tee -a "$LOG_FILE"
+    timeout 10 mariadb -e "FLUSH PRIVILEGES;" 2>&1 | tee -a "$LOG_FILE" || echo "FLUSH PRIVILEGES завершён (timeout или ошибка)" | tee -a "$LOG_FILE"
+    echo "FLUSH PRIVILEGES завершён" | tee -a "$LOG_FILE"
+
+    echo "Отправляю webhook о завершении удаления..." | tee -a "$LOG_FILE"
+    log_progress "Все найденные базы данных и пользователи успешно удалены"
+    echo "Webhook отправлен" | tee -a "$LOG_FILE"
+else
+    echo "Базы данных не найдены" | tee -a "$LOG_FILE"
+    echo "Отправляю webhook..." | tee -a "$LOG_FILE"
+    log_progress "Базы данных не найдены, пропускаю удаление"
+    echo "Webhook отправлен" | tee -a "$LOG_FILE"
+fi
+
+echo "Блок удаления баз завершён успешно" | tee -a "$LOG_FILE"
+
+echo "Продолжаю выполнение скрипта..." | tee -a "$LOG_FILE"
+
+# Теперь проверяем и удаляем из HestiaCP
+echo "Перед проверкой HestiaCP..." | tee -a "$LOG_FILE"
+log_progress "Проверяю существование базы данных в HestiaCP..."
+echo "После webhook проверки HestiaCP..." | tee -a "$LOG_FILE"
+
+HESTIA_DB_EXISTS=false
+if v-list-database "$USER" "$SHORT_DB_NAME" >/dev/null 2>&1; then
+    HESTIA_DB_EXISTS=true
+    log_progress "База данных $SHORT_DB_NAME найдена в HestiaCP. Удаляю..."
+
+    # Удаляем через HestiaCP
+    DB_DELETE_OUTPUT=$(v-delete-database "$USER" "$SHORT_DB_NAME" 2>&1) || DB_DELETE_FAILED=$?
+
+    if [ "${DB_DELETE_FAILED:-0}" -ne 0 ]; then
+        echo "v-delete-database вернул код ошибки: $DB_DELETE_FAILED" | tee -a "$LOG_FILE"
+        echo "Вывод команды: $DB_DELETE_OUTPUT" | tee -a "$LOG_FILE"
+        log_progress "Предупреждение: не удалось удалить через HestiaCP (уже удалено из MySQL)"
     else
-        SHORT_DB_USER="$DB_USER"
+        log_progress "База данных $SHORT_DB_NAME успешно удалена из HestiaCP"
+    fi
+else
+    log_progress "База данных $SHORT_DB_NAME не найдена в HestiaCP"
+fi
+
+# Удаляем записи о БД из конфигурации HestiaCP
+echo "Проверяю конфигурационные файлы HestiaCP..." | tee -a "$LOG_FILE"
+HESTIA_USER_CONF="/usr/local/hestia/data/users/${USER}"
+
+if [ -d "$HESTIA_USER_CONF" ]; then
+    echo "Ищу конфигурационные файлы баз данных..." | tee -a "$LOG_FILE"
+
+    # Проверяем db.conf
+    if [ -f "$HESTIA_USER_CONF/db.conf" ]; then
+        echo "Содержимое db.conf до очистки:" | tee -a "$LOG_FILE"
+        grep -E "${SHORT_DB_NAME}|${DB_NAME}" "$HESTIA_USER_CONF/db.conf" | tee -a "$LOG_FILE" || echo "Записей не найдено" | tee -a "$LOG_FILE"
+
+        # Удаляем все строки, содержащие наши базы
+        sed -i.bak "/${SHORT_DB_NAME}/d" "$HESTIA_USER_CONF/db.conf" 2>&1 | tee -a "$LOG_FILE" || true
+        sed -i.bak "/${DB_NAME}/d" "$HESTIA_USER_CONF/db.conf" 2>&1 | tee -a "$LOG_FILE" || true
+
+        echo "Содержимое db.conf после очистки:" | tee -a "$LOG_FILE"
+        grep -E "${SHORT_DB_NAME}|${DB_NAME}" "$HESTIA_USER_CONF/db.conf" | tee -a "$LOG_FILE" || echo "Записи успешно удалены" | tee -a "$LOG_FILE"
     fi
 
-    # Создаём базу данных
-    DB_CREATE_OUTPUT=$(v-add-database "$USER" "$SHORT_DB_NAME" "$SHORT_DB_USER" "$DB_PASS" "mysql" "localhost" "utf8mb4" 2>&1) || DB_CREATE_FAILED=$?
+    # Проверяем и удаляем папки баз данных
+    for possible_db in "$SHORT_DB_NAME" "$DB_NAME" "${USER_NO_UNDERSCORE}_${SHORT_DB_NAME}"; do
+        if [ -d "$HESTIA_USER_CONF/$possible_db" ]; then
+            echo "Удаляю папку конфигурации БД: $HESTIA_USER_CONF/$possible_db" | tee -a "$LOG_FILE"
+            rm -rf "$HESTIA_USER_CONF/$possible_db" 2>&1 | tee -a "$LOG_FILE"
+        fi
+    done
+fi
 
-    if [ "${DB_CREATE_FAILED:-0}" -ne 0 ]; then
-        echo "v-add-database вернул код ошибки: $DB_CREATE_FAILED" | tee -a "$LOG_FILE"
-        echo "Вывод команды: $DB_CREATE_OUTPUT" | tee -a "$LOG_FILE"
+# Ждём для применения изменений
+echo "Жду 2 секунды для применения изменений..." | tee -a "$LOG_FILE"
+sleep 2
+
+# Проверяем ещё раз, что база действительно удалена
+echo "Финальная проверка удаления БД в MySQL..." | tee -a "$LOG_FILE"
+DB_STILL_EXISTS=$(mariadb -e "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='$FULL_DB_NAME';" 2>/dev/null | grep -c "$FULL_DB_NAME" || echo "0")
+
+if [ "$DB_STILL_EXISTS" -gt 0 ]; then
+    log_progress "ВНИМАНИЕ: База $FULL_DB_NAME всё ещё существует! Повторная попытка удаления..."
+
+    # Принудительное удаление с остановкой всех соединений
+    echo "Закрываю все соединения к БД..." | tee -a "$LOG_FILE"
+    mariadb -e "SELECT CONCAT('KILL ', id, ';') FROM information_schema.processlist WHERE db='$FULL_DB_NAME';" 2>&1 | grep KILL | mariadb 2>&1 | tee -a "$LOG_FILE" || true
+
+    sleep 1
+
+    echo "Повторное удаление БД..." | tee -a "$LOG_FILE"
+    mariadb -e "DROP DATABASE IF EXISTS \`$FULL_DB_NAME\`;" 2>&1 | tee -a "$LOG_FILE"
+
+    sleep 1
+
+    # Проверяем ещё раз
+    DB_STILL_EXISTS=$(mariadb -e "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='$FULL_DB_NAME';" 2>/dev/null | grep -c "$FULL_DB_NAME" || echo "0")
+
+    if [ "$DB_STILL_EXISTS" -gt 0 ]; then
         RESTORE_STATUS="error"
-        RESTORE_MESSAGE="Ошибка: не удалось создать базу данных $DB_NAME. Детали: $DB_CREATE_OUTPUT"
+        RESTORE_MESSAGE="КРИТИЧЕСКАЯ ОШИБКА: Не удалось удалить базу данных $FULL_DB_NAME даже после повторных попыток"
         send_webhook
         exit 1
     else
-        log_progress "База данных $DB_NAME успешно создана в HestiaCP"
+        log_progress "База данных успешно удалена после повторной попытки"
     fi
+else
+    echo "База данных успешно удалена, можно создавать новую" | tee -a "$LOG_FILE"
+fi
 
-    # SQL дамп всегда в корне архива, ищем его рекурсивно в RESTORE_DIR и WP_PATH
+log_progress "Создаю базу данных $DB_NAME..."
+
+# Извлекаем короткое имя пользователя БД без префикса
+# Применяем ту же логику, что и для DB_NAME
+if [[ "$DB_USER" == ${USER}_* ]]; then
+    SHORT_DB_USER="${DB_USER#${USER}_}"
+    echo "Префикс пользователя '$USER' найден в DB_USER и удален. Короткое имя пользователя: $SHORT_DB_USER" | tee -a "$LOG_FILE"
+elif [[ "$DB_USER" == ${USER%_}_* ]]; then
+    SHORT_DB_USER="${DB_USER#${USER%_}_}"
+    echo "Префикс пользователя '${USER%_}' найден в DB_USER и удален. Короткое имя пользователя: $SHORT_DB_USER" | tee -a "$LOG_FILE"
+else
+    USER_NO_UNDERSCORE="${USER//_/}"
+    if [[ "$DB_USER" == ${USER_NO_UNDERSCORE}_* ]]; then
+        SHORT_DB_USER="${DB_USER#${USER_NO_UNDERSCORE}_}"
+        echo "Префикс пользователя '$USER_NO_UNDERSCORE' (без подчеркиваний) найден в DB_USER и удален. Короткое имя пользователя: $SHORT_DB_USER" | tee -a "$LOG_FILE"
+    else
+        SHORT_DB_USER="$DB_USER"
+        echo "Префикс пользователя не найден в DB_USER, используется полное имя: $SHORT_DB_USER" | tee -a "$LOG_FILE"
+    fi
+fi
+
+echo "Итоговые параметры для v-add-database:" | tee -a "$LOG_FILE"
+echo "  USER: $USER" | tee -a "$LOG_FILE"
+echo "  SHORT_DB_NAME: $SHORT_DB_NAME" | tee -a "$LOG_FILE"
+echo "  SHORT_DB_USER: $SHORT_DB_USER" | tee -a "$LOG_FILE"
+echo "  HestiaCP создаст БД с именем: ${USER}_${SHORT_DB_NAME}" | tee -a "$LOG_FILE"
+
+# Создаём базу данных
+echo "Выполняю: v-add-database $USER $SHORT_DB_NAME $SHORT_DB_USER [PASS] mysql localhost utf8mb4" | tee -a "$LOG_FILE"
+DB_CREATE_OUTPUT=$(v-add-database "$USER" "$SHORT_DB_NAME" "$SHORT_DB_USER" "$DB_PASS" "mysql" "localhost" "utf8mb4" 2>&1) || DB_CREATE_FAILED=$?
+
+echo "v-add-database завершён с кодом: ${DB_CREATE_FAILED:-0}" | tee -a "$LOG_FILE"
+
+if [ "${DB_CREATE_FAILED:-0}" -ne 0 ]; then
+    echo "v-add-database вернул код ошибки: $DB_CREATE_FAILED" | tee -a "$LOG_FILE"
+    echo "Вывод команды: $DB_CREATE_OUTPUT" | tee -a "$LOG_FILE"
+    RESTORE_STATUS="error"
+    RESTORE_MESSAGE="Ошибка: не удалось создать базу данных $DB_NAME. Детали: $DB_CREATE_OUTPUT"
+    send_webhook
+    exit 1
+else
+    echo "База данных успешно создана" | tee -a "$LOG_FILE"
+    log_progress "База данных ${USER}_${SHORT_DB_NAME} успешно создана в HestiaCP"
+fi
+
+    # SQL дамп ищем в разных местах и форматах
     log_progress "Поиск SQL дампа для импорта..."
-    SQL_DUMP=$(find "$BACKUP_DIR" -type f \( -name "*.sql" -o -name "*.sql.gz" \) 2>/dev/null | head -n 1 || true)
 
-    # Если не найден в RESTORE_DIR, ищем в WP_PATH (где распакован архив)
+    # Список возможных расширений SQL дампов
+    SQL_EXTENSIONS=( "*.sql" "*.sql.gz" "*.sql.zst" )
+
+    # 1. Ищем в директории db/ внутри распакованного архива
+    # Для полных бэкапов HestiaCP структура: /backup/backup_file/db/dbname/dbname.mysql.sql.zst
+    echo "Поиск SQL дампа для БД: $DB_NAME (SHORT_DB_NAME: $SHORT_DB_NAME)" | tee -a "$LOG_FILE"
+
+    # Определяем директорию с распакованным архивом
+    # Ищем в /home/$USER/web/$DOMAIN/ где v-restore-user распаковал бэкап
+    RESTORE_TEMP_DIR="/home/$USER/web/$DOMAIN"
+
+    # Также ищем в BACKUP_DIR и во временной директории извлечения
+    SEARCH_DIRS=(
+        "$TEMP_EXTRACT_DIR"
+        "$RESTORE_TEMP_DIR"
+        "/home/$USER"
+        "$BACKUP_DIR"
+    )
+
+    USER_NO_UNDERSCORE="${USER//_/}"
+
+    # Возможные имена SQL файлов
+    POSSIBLE_SQL_NAMES=(
+        "${DB_NAME}.mysql"
+        "${USER_NO_UNDERSCORE}_${SHORT_DB_NAME}.mysql"
+        "${SHORT_DB_NAME}.mysql"
+    )
+
+    echo "Ищу SQL дамп в директориях: ${SEARCH_DIRS[*]}" | tee -a "$LOG_FILE"
+    echo "Возможные имена SQL файлов: ${POSSIBLE_SQL_NAMES[*]}" | tee -a "$LOG_FILE"
+
+    # Перебираем директории поиска
+    for search_dir in "${SEARCH_DIRS[@]}"; do
+        if [ ! -d "$search_dir" ]; then
+            continue
+        fi
+
+        echo "Поиск в директории: $search_dir" | tee -a "$LOG_FILE"
+
+        # Перебираем возможные имена
+        for sql_name in "${POSSIBLE_SQL_NAMES[@]}"; do
+            # Перебираем расширения
+            for ext in "sql" "sql.gz" "sql.zst"; do
+                echo "  Проверяю: */db/*/${sql_name}.${ext}" | tee -a "$LOG_FILE"
+
+                # Ищем файл
+                SQL_DUMP=$(find "$search_dir" -type f -path "*/db/*" -name "${sql_name}.${ext}" 2>/dev/null | head -n 1 || true)
+
+                if [ -n "$SQL_DUMP" ] && [ -f "$SQL_DUMP" ]; then
+                    echo "✓ Найден SQL дамп: $SQL_DUMP" | tee -a "$LOG_FILE"
+                    log_progress "SQL дамп найден: $(basename $SQL_DUMP)"
+                    break 3  # Выходим из всех трёх циклов
+                fi
+            done
+        done
+    done
+
+    # Если не найден, делаем более широкий поиск по всем файлам (без ограничения на путь */db/*)
     if [ -z "$SQL_DUMP" ] || [ ! -f "$SQL_DUMP" ]; then
-        SQL_DUMP=$(find "$WP_PATH" -type f \( -name "*.sql" -o -name "*.sql.gz" \) 2>/dev/null | head -n 1 || true)
+        echo "Широкий поиск всех SQL файлов в директориях (без фильтра пути)..." | tee -a "$LOG_FILE"
+        for search_dir in "${SEARCH_DIRS[@]}"; do
+            if [ ! -d "$search_dir" ]; then
+                echo "  Директория не существует: $search_dir" | tee -a "$LOG_FILE"
+                continue
+            fi
+
+            echo "  Ищу в: $search_dir" | tee -a "$LOG_FILE"
+
+            # Ищем без ограничения на путь */db/*
+            SQL_DUMP=$(find "$search_dir" -type f \( -name "*.sql" -o -name "*.sql.gz" -o -name "*.sql.zst" \) 2>/dev/null | head -n 1 || true)
+
+            if [ -n "$SQL_DUMP" ] && [ -f "$SQL_DUMP" ]; then
+                echo "✓ Найден SQL дамп при широком поиске: $SQL_DUMP" | tee -a "$LOG_FILE"
+                log_progress "SQL дамп найден: $(basename $SQL_DUMP)"
+                break
+            else
+                echo "  SQL файлы не найдены в $search_dir" | tee -a "$LOG_FILE"
+            fi
+        done
     fi
 
-    # Если WordPress в подпапке, SQL дамп может быть в родительской папке (в корне архива)
+    # Если всё ещё не найден, показываем содержимое TEMP_EXTRACT_DIR для диагностики
+    if [ -z "$SQL_DUMP" ] || [ ! -f "$SQL_DUMP" ]; then
+        if [ -n "$TEMP_EXTRACT_DIR" ] && [ -d "$TEMP_EXTRACT_DIR" ]; then
+            echo "=== ДИАГНОСТИКА: Содержимое $TEMP_EXTRACT_DIR ===" | tee -a "$LOG_FILE"
+            ls -laR "$TEMP_EXTRACT_DIR" | head -100 | tee -a "$LOG_FILE"
+            echo "=== Конец диагностики ===" | tee -a "$LOG_FILE"
+        fi
+    fi
+
+    # 2. Если не найден в db/, ищем в BACKUP_DIR
+    if [ -z "$SQL_DUMP" ] || [ ! -f "$SQL_DUMP" ]; then
+        echo "SQL дамп не найден в db/, ищу в директории бэкапов..." | tee -a "$LOG_FILE"
+        for ext in "${SQL_EXTENSIONS[@]}"; do
+            SQL_DUMP=$(find "$BACKUP_DIR" -type f -name "$ext" 2>/dev/null | head -n 1 || true)
+            if [ -n "$SQL_DUMP" ] && [ -f "$SQL_DUMP" ]; then
+                echo "Найден SQL дамп в BACKUP_DIR: $SQL_DUMP" | tee -a "$LOG_FILE"
+                break
+            fi
+        done
+    fi
+
+    # 3. Если не найден, ищем в WP_PATH (где распакован архив)
+    if [ -z "$SQL_DUMP" ] || [ ! -f "$SQL_DUMP" ]; then
+        echo "SQL дамп не найден, ищу в WP_PATH: $WP_PATH" | tee -a "$LOG_FILE"
+        for ext in "${SQL_EXTENSIONS[@]}"; do
+            SQL_DUMP=$(find "$WP_PATH" -type f -name "$ext" 2>/dev/null | head -n 1 || true)
+            if [ -n "$SQL_DUMP" ] && [ -f "$SQL_DUMP" ]; then
+                echo "Найден SQL дамп в WP_PATH: $SQL_DUMP" | tee -a "$LOG_FILE"
+                break
+            fi
+        done
+    fi
+
+    # 4. Если WordPress в подпапке, SQL дамп может быть в родительской папке
     if [ -z "$SQL_DUMP" ] || [ ! -f "$SQL_DUMP" ]; then
         PARENT_PATH=$(dirname "$WP_PATH")
-        SQL_DUMP=$(find "$PARENT_PATH" -maxdepth 1 -type f \( -name "*.sql" -o -name "*.sql.gz" \) 2>/dev/null | head -n 1 || true)
         echo "Поиск SQL дампа в родительской папке: $PARENT_PATH" | tee -a "$LOG_FILE"
+        for ext in "${SQL_EXTENSIONS[@]}"; do
+            SQL_DUMP=$(find "$PARENT_PATH" -maxdepth 1 -type f -name "$ext" 2>/dev/null | head -n 1 || true)
+            if [ -n "$SQL_DUMP" ] && [ -f "$SQL_DUMP" ]; then
+                echo "Найден SQL дамп в родительской папке: $SQL_DUMP" | tee -a "$LOG_FILE"
+                break
+            fi
+        done
     fi
 
-    echo "Найден SQL дамп: $SQL_DUMP" | tee -a "$LOG_FILE"
+    echo "Итоговый найденный SQL дамп: $SQL_DUMP" | tee -a "$LOG_FILE"
     if [ -n "$SQL_DUMP" ] && [ -f "$SQL_DUMP" ]; then
-        log_progress "Импортирую SQL дамп в базу данных $DB_NAME..."
+        # Проверяем расширение файла и распаковываем если нужно
+        if [[ "$SQL_DUMP" == *.zst ]]; then
+            log_progress "Распаковываю SQL дамп (zstd)..."
+            UNCOMPRESSED_SQL="${SQL_DUMP%.zst}"
+            if zstd -d "$SQL_DUMP" -o "$UNCOMPRESSED_SQL" 2>&1 | tee -a "$LOG_FILE"; then
+                echo "SQL дамп успешно распакован: $UNCOMPRESSED_SQL" | tee -a "$LOG_FILE"
+                SQL_DUMP="$UNCOMPRESSED_SQL"
+                log_progress "SQL дамп распакован, начинаю импорт..."
+            else
+                RESTORE_STATUS="error"
+                RESTORE_MESSAGE="Ошибка при распаковке SQL дампа (zstd)"
+                send_webhook
+                exit 1
+            fi
+        elif [[ "$SQL_DUMP" == *.gz ]]; then
+            log_progress "Распаковываю SQL дамп (gzip)..."
+            if gunzip -c "$SQL_DUMP" > "${SQL_DUMP%.gz}" 2>&1 | tee -a "$LOG_FILE"; then
+                SQL_DUMP="${SQL_DUMP%.gz}"
+                echo "SQL дамп успешно распакован: $SQL_DUMP" | tee -a "$LOG_FILE"
+                log_progress "SQL дамп распакован, начинаю импорт..."
+            else
+                RESTORE_STATUS="error"
+                RESTORE_MESSAGE="Ошибка при распаковке SQL дампа (gzip)"
+                send_webhook
+                exit 1
+            fi
+        else
+            log_progress "Начинаю импорт SQL дампа в базу данных..."
+        fi
 
         # Используем root доступ для импорта (скрипт запускается от root)
-        if ! mariadb "$DB_NAME" < "$SQL_DUMP" >> "$LOG_FILE" 2>&1; then
+        echo "Импортирую SQL дамп в базу данных: ${USER}_${SHORT_DB_NAME}" | tee -a "$LOG_FILE"
+        FULL_DB_NAME="${USER}_${SHORT_DB_NAME}"
+        if ! mariadb "$FULL_DB_NAME" < "$SQL_DUMP" >> "$LOG_FILE" 2>&1; then
             RESTORE_STATUS="error"
             RESTORE_MESSAGE="Ошибка при импорте SQL-дампа"
             send_webhook
             exit 1
         fi
 
+        # Удаляем распакованный SQL дамп после импорта
+        if [[ "$SQL_DUMP" == *.sql ]] && [[ -f "${SQL_DUMP}.zst" || -f "${SQL_DUMP}.gz" ]]; then
+            rm -f "$SQL_DUMP"
+            echo "Распакованный SQL дамп удалён" | tee -a "$LOG_FILE"
+        fi
+
         log_progress "SQL дамп успешно импортирован в базу данных"
+
+        echo "=== CHECKPOINT: SQL дамп импортирован успешно ===" | tee -a "$LOG_FILE"
+        echo "Время: $(date '+%F %T')" | tee -a "$LOG_FILE"
     else
         RESTORE_STATUS="error"
         RESTORE_MESSAGE="SQL-дамп не найден для новой БД"
         send_webhook
         exit 1
     fi
-fi
+
+echo "=== CHECKPOINT: Начинаю пересборку HestiaCP ===" | tee -a "$LOG_FILE"
+echo "Время: $(date '+%F %T')" | tee -a "$LOG_FILE"
 
 # === Пересборка Hestia и отправка webhook ===
 log_progress "Пересборка конфигурации веб-доменов и обновление статистики..."
-v-rebuild-web-domains "$USER" >/dev/null 2>&1 || true
-v-update-user-stats "$USER" >/dev/null 2>&1 || true
 
-# === Удаляем архив при успешном восстановлении ===
-log_progress "Очистка временных файлов..."
+echo "Выполняю v-rebuild-web-domains..." | tee -a "$LOG_FILE"
+v-rebuild-web-domains "$USER" 2>&1 | tee -a "$LOG_FILE" || echo "v-rebuild-web-domains завершён с ошибкой (игнорируется)" | tee -a "$LOG_FILE"
+echo "=== CHECKPOINT: v-rebuild-web-domains завершён ===" | tee -a "$LOG_FILE"
+
+echo "Выполняю v-update-user-stats..." | tee -a "$LOG_FILE"
+v-update-user-stats "$USER" 2>&1 | tee -a "$LOG_FILE" || echo "v-update-user-stats завершён с ошибкой (игнорируется)" | tee -a "$LOG_FILE"
+echo "=== CHECKPOINT: v-update-user-stats завершён ===" | tee -a "$LOG_FILE"
+
+echo "Пересборка завершена" | tee -a "$LOG_FILE"
+
+# === Устанавливаем финальный статус успеха ===
+echo "=== CHECKPOINT: Устанавливаю финальный статус успеха ===" | tee -a "$LOG_FILE"
+RESTORE_STATUS="done"
+RESTORE_MESSAGE="Восстановление домена $DOMAIN выполнено успешно"
+
+# === Удаляем архив ТОЛЬКО при успешном восстановлении ===
+echo "=== CHECKPOINT: Начинаю удаление временных файлов ===" | tee -a "$LOG_FILE"
+echo "Удаляю временные файлы после успешного восстановления..." | tee -a "$LOG_FILE"
+
+# Удаляем временную директорию с извлечёнными SQL дампами
+if [ -n "$TEMP_EXTRACT_DIR" ] && [ -d "$TEMP_EXTRACT_DIR" ]; then
+    echo "Удаляю временную директорию: $TEMP_EXTRACT_DIR" | tee -a "$LOG_FILE"
+    rm -rf "$TEMP_EXTRACT_DIR" 2>&1 | tee -a "$LOG_FILE" || echo "Ошибка при удалении временной директории (игнорируется)" | tee -a "$LOG_FILE"
+    echo "Временная директория удалена: $TEMP_EXTRACT_DIR" | tee -a "$LOG_FILE"
+fi
 
 # Удаляем оригинальный скачанный файл
 ORIGINAL_BACKUP=$(basename "$FULL_S3_PATH")
 if [ -f "$BACKUP_DIR/$ORIGINAL_BACKUP" ]; then
-    rm -f "$BACKUP_DIR/$ORIGINAL_BACKUP"
+    echo "Удаляю оригинальный архив: $ORIGINAL_BACKUP" | tee -a "$LOG_FILE"
+    rm -f "$BACKUP_DIR/$ORIGINAL_BACKUP" 2>&1 | tee -a "$LOG_FILE" || echo "Ошибка при удалении архива (игнорируется)" | tee -a "$LOG_FILE"
     echo "Оригинальный архив удалён: $ORIGINAL_BACKUP" | tee -a "$LOG_FILE"
 fi
 
 # Удаляем переименованный архив (если был создан)
 if [ -f "$BACKUP_DIR/$BACKUP_FILE" ] && [ "$BACKUP_FILE" != "$ORIGINAL_BACKUP" ]; then
-    rm -f "$BACKUP_DIR/$BACKUP_FILE"
+    echo "Удаляю переименованный архив: $BACKUP_FILE" | tee -a "$LOG_FILE"
+    rm -f "$BACKUP_DIR/$BACKUP_FILE" 2>&1 | tee -a "$LOG_FILE" || echo "Ошибка при удалении архива (игнорируется)" | tee -a "$LOG_FILE"
     echo "Переименованный архив удалён: $BACKUP_FILE" | tee -a "$LOG_FILE"
 fi
 
-# === Устанавливаем финальный статус успеха ===
-RESTORE_STATUS="done"
-RESTORE_MESSAGE="Восстановление домена $DOMAIN выполнено успешно"
-send_webhook
+echo "Очистка временных файлов завершена" | tee -a "$LOG_FILE"
+
+echo "Отправляю финальный webhook..." | tee -a "$LOG_FILE"
+send_webhook || echo "Ошибка при отправке финального webhook (игнорируется)" | tee -a "$LOG_FILE"
+
 echo "=== End restore $DOMAIN at $(date '+%F %T') ===" | tee -a "$LOG_FILE"
+echo "Скрипт успешно завершён" | tee -a "$LOG_FILE"
 exit 0
